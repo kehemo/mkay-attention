@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+
+# Change this to your own docker registry.
+DOCKER_HUB_USERNAME="my_username"
+DEVCTR_IMAGE=${DOCKER_HUB_USERNAME}"/6_s894_finalproject_devctr:latest"
+
+# Environment.
+DEVCTR_DIR=$(pwd)/devctr
+
+# Path to the project source dir on the host.
+SRC_DIR=$(pwd)/src
+
+# Path to the project source dir in the dev container.
+CTR_SRC_DIR="/final_project"
+
+# Path to the build dir on the host.
+BUILD_DIR=$(pwd)/build
+
+# Path to the build dir in the dev container.
+CTR_BUILD_DIR=/build
+
+# Helpers.
+# Create all need dirs on the host.
+ensure_build_dir() {
+    for dir in "$BUILD_DIR"; do
+        rm -rf "$dir"
+        mkdir -p "$dir"
+    done
+}
+
+# Run development container.
+# Usage: run_devctr <docker args> -- <container args>
+run_devctr() {
+    docker_args=()
+    ctr_args=()
+    docker_args_done=false
+    while [[ $# -gt 0 ]]; do
+        [[ "$1" = "--" ]] && {
+            docker_args_done=true
+            shift
+            continue
+        }
+        [[ $docker_args_done = true ]] && ctr_args+=("$1") || docker_args+=("$1")
+        shift
+    done
+
+    # Run the actual development container.
+    docker run "${docker_args[@]}" \
+        --rm \
+        --volume "$SRC_DIR:$CTR_SRC_DIR" \
+        --volume "$BUILD_DIR:$CTR_BUILD_DIR" \
+        "$DEVCTR_IMAGE" "${ctr_args[@]}"
+}
+
+# Builds the development container from its Dockerfile.
+#
+build_devctr() {
+    echo "Building development container..."
+    docker_file_name=$DEVCTR_DIR/Dockerfile
+    docker build -t "$DEVCTR_IMAGE" -f "$docker_file_name" .
+
+    # echo "Pushing development container into " ${DEVCTR_IMAGE}
+    # docker push ${DEVCTR_IMAGE}
+
+    echo "Done."
+}
+
+# Builds project inside the development container.
+build_project() {
+    ensure_build_dir
+    # Build inside the container.
+    run_devctr \
+        --workdir "$CTR_SRC_DIR" \
+        -- \
+        ./build.sh
+    # Copy the run script.
+    cp ${SRC_DIR}/run.sh ${BUILD_DIR}
+    # Make shippable tarball.
+    tar -cvf build.tar -C ${BUILD_DIR} .
+}
+
+# Check if a function with the given name exists, and call it.
+if declare -f "$1" > /dev/null; then
+    "$@"
+else
+    echo "Function $1 not found"
+    exit 1
+fi
