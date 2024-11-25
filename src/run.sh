@@ -11,24 +11,5 @@
 # We can see what's on the execution server in the home dir:
 echo "Content:"; ls
 
-# # Run binary.
-# ./vector_add
-
-# Running diagnostics
-# Check if the package is actually installed
-pip list | grep flash-attn
-
-# Check where the package files are
-pip show flash-attn
-
-# Check if CUDA libraries are visible
-ldconfig -p | grep libcuda
-
-# Check CUDA environment
-echo $CUDA_HOME
-echo $LD_LIBRARY_PATH
-
-# Run the reference FlashAttention benchmark
-echo "Running example FlashAttention benchmark"
-cd benchmarks/
-python3 benchmark_flash_attention.py
+# Run binary.
+./vector_add
