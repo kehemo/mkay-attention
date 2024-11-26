@@ -13,4 +13,6 @@ echo "Building the project..."
 # -----     * all output files (e.g. generated binaries, test inputs, etc.) must be places into $CTR_BUILD_DIR
 # ----------------------------------------------------------------------------------
 # Build code.
-nvcc -O3 vector_add.cu -o ${CTR_BUILD_DIR}/vector_add
+# nvcc -O3 vector_add.cu -o ${CTR_BUILD_DIR}/vector_add
+
+cp -r examples ${CTR_BUILD_DIR}/examples
