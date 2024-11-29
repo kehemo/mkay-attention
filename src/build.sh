@@ -15,4 +15,5 @@ echo "Building the project..."
 # Build code.
 # nvcc -O3 vector_add.cu -o ${CTR_BUILD_DIR}/vector_add
 
-cp -r examples ${CTR_BUILD_DIR}/examples
+echo "Move benchmarks over"
+cp -r benchmarks ${CTR_BUILD_DIR}/benchmarks

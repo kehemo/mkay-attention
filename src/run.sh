@@ -14,5 +14,5 @@ echo "Content:"; ls
 # Run binary.
 # ./vector_add
 
-cd examples/flash-attention/benchmarks
+cd benchmarks
 python3 benchmark_flash_attention.py
