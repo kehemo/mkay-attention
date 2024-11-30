@@ -73,7 +73,7 @@ def time_fwd_bwd(func, *args, **kwargs):
 
 repeats = 30
 device = 'cuda'
-dtype = torch.float16
+dtype = torch.bfloat16
 
 # bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
 bs_seqlen_vals = [(1, 8192)]
