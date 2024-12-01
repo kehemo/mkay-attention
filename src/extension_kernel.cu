@@ -71,7 +71,7 @@ __global__ void compute_attn_scores(
             int i = tile_i * tile_dim + row;
             int j = tile_j * tile_dim + col;
 
-            for (int d = 0; d < head_dim; d++) { // FIX THIS LATER
+            for (int d = 0; d < head_dim; d++) {
 
                 uint32_t q_idx = batch_id * batch_stride + i * token_stride + head_id * head_stride + d * dim_stride;
                 uint32_t k_idx = batch_id * batch_stride + j * token_stride + head_id * head_stride + d * dim_stride;
@@ -90,7 +90,6 @@ __global__ void compute_attn_scores(
             uint32_t o_idx = batch_id * batch_stride_out + head_id * head_stride_out + i * token_stride_out + j;
             scores[o_idx] = sum;
 
-            break;
         }
     }
 }
