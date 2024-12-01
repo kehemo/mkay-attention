@@ -16,6 +16,7 @@ echo "Building the project..."
 export TORCH_CUDA_ARCH_LIST='8.6'
 python3 setup.py build
 
+ls
 # Copy built module.
 cp build/lib.linux-x86_64-3.10/cuda_extension.cpython-310-x86_64-linux-gnu.so ${CTR_BUILD_DIR}/cuda_extension.so
 
