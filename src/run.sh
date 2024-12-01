@@ -8,11 +8,4 @@
 # -----     * feel free to execute `ls` form here to check the content of the workdir
 # ----------------------------------------------------------------------------------
 
-# We can see what's on the execution server in the home dir:
-echo "Content:"; ls
-
-# Run binary.
-# ./vector_add
-
-cd benchmarks
-python3 benchmark_flash_attention.py
+python3 example.py

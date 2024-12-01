@@ -12,8 +12,12 @@ echo "Building the project..."
 # -----     * the current workdir contains all files from your src/
 # -----     * all output files (e.g. generated binaries, test inputs, etc.) must be places into $CTR_BUILD_DIR
 # ----------------------------------------------------------------------------------
-# Build code.
-# nvcc -O3 vector_add.cu -o ${CTR_BUILD_DIR}/vector_add
+# Build it.
+export TORCH_CUDA_ARCH_LIST='8.6'
+python3 setup.py build
 
-echo "Move benchmarks over"
-cp -r benchmarks ${CTR_BUILD_DIR}/benchmarks
+# Copy built module.
+cp build/lib.linux-x86_64-3.10/cuda_extension.cpython-310-x86_64-linux-gnu.so ${CTR_BUILD_DIR}/cuda_extension.so
+
+# Copy example.
+cp example.py ${CTR_BUILD_DIR}/ 
