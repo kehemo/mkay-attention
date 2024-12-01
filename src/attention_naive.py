@@ -93,7 +93,7 @@ def attention_cuda(qkv):
 
 def get_tensor_difference(t1, t2):
     diff = (t1 - t2).to(float) # torch.quantile() doesn't work in bf16 :(
-    rtol = diff / t2
+    rtol = diff / t1
     rtol = rtol.abs().flatten()
     
     print("========================")
