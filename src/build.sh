@@ -15,5 +15,18 @@ echo "Building the project..."
 # Build code.
 # nvcc -O3 vector_add.cu -o ${CTR_BUILD_DIR}/vector_add
 
-echo "Move benchmarks over"
-cp -r benchmarks ${CTR_BUILD_DIR}/benchmarks
+# echo "Move benchmarks over"
+# cp -r benchmarks ${CTR_BUILD_DIR}/benchmarks
+
+
+
+# Build it.
+export TORCH_CUDA_ARCH_LIST='8.6'
+python3 setup.py build
+
+# Copy built module.
+cp build/lib.linux-x86_64-3.10/cuda_extension.cpython-310-x86_64-linux-gnu.so ${CTR_BUILD_DIR}/cuda_extension.so
+
+# Copy example.
+cp example.py ${CTR_BUILD_DIR}/ 
+cp attention_naive.py ${CTR_BUILD_DIR}/
