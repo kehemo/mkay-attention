@@ -13,26 +13,63 @@ def attention_pytorch(qkv, causal=True):
     Output:
         output: (batch_size, seqlen, nheads, head_dim)
     """
+    attn_dtype, attn_device = qkv.dtype, qkv.device
+
+    batch_size, seqlen, _, nheads, d = qkv.shape
+    q, k, v = qkv.unbind(dim=2)
+
+    softmax_scale = 1.0 / math.sqrt(d)
+
+
+    attn_score_shape = (batch_size * nheads, seqlen, seqlen)
+    attn_scores = torch.empty(attn_score_shape, dtype = attn_dtype, device = attn_device)
+
+
+    """
+    ========================================
+    Implementation fork
+    - they have a long messy way of computing things
+    - i think einsum is a little easier to read here, but its up to whatever you like
+
+    NOTE: softmax_scale =/= 1.0 introduces small tolerance issues.
+    If you set it to 1.0, the results will be exactly the same... weird.
+    ========================================
+    """
+    
+    # technically they are the ground truth >:(
+    use_approach_1 = True 
+    if use_approach_1:
+        # approach 1
+        attn_scores_re = attn_scores.clone().detach()
+        
+        q_re = rearrange(q, "b t h d -> (b h) t d")
+        k_re = rearrange(k, "b s h d -> (b h) d s")
+
+        attn_scores_re = torch.baddbmm(attn_scores_re, q_re, k_re, beta = 0, alpha = softmax_scale)
+        attn_scores_re = rearrange(attn_scores_re, "(b h) t s -> b h t s", h = nheads)
+
+        attn_scores = attn_scores_re
+    else: 
+        # approach 2
+        attn_scores = torch.einsum("b t h d, b s h d -> b h t s", q, k) * softmax_scale
+
+
+    attention = torch.softmax(attn_scores, dim = -1) # softmax along key dimension
+    output = torch.einsum("b h t s, b s h d -> b t h d", attention, v)
+
+    return output.to(dtype=qkv.dtype)
+
+def attention_cuda(qkv):
+    """
+    Arguments:
+        qkv: (batch_size, seqlen, 3, nheads, head_dim)
+        dropout_p: float
+    Output:
+        output: (batch_size, seqlen, nheads, head_dim)
+    """
     batch_size, seqlen, _, nheads, d = qkv.shape
     q, k, v = qkv.unbind(dim=2)
     return cuda_extension.attention_forward(q, k, v)
-    q = rearrange(q, "b t h d -> (b h) t d")
-    k = rearrange(k, "b s h d -> (b h) d s")
-    softmax_scale = 1.0 / math.sqrt(d)
-
-    # Preallocate attn_weights for `baddbmm`
-    scores = torch.empty(
-        batch_size * nheads, seqlen, seqlen, dtype=qkv.dtype, device=qkv.device
-    )
-    scores = rearrange(
-        torch.baddbmm(scores, q, k, beta=0, alpha=softmax_scale),
-        "(b h) t s -> b h t s",
-        h=nheads,
-    )
-
-    attention = torch.softmax(scores, dim=-1)
-    output = torch.einsum("bhts,bshd->bthd", attention, v)
-    return output.to(dtype=qkv.dtype)
 
 
 if __name__ == "__main__":
