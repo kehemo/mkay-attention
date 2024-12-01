@@ -40,9 +40,10 @@ constexpr int tile_dim = 32;
 constexpr int num_threads_axis = 32;
 
 __global__ void compute_attn_scores(
-    const num *q, const num *k, const num *v,  
+    num *q, const num *k, const num *v,  
     num *scores, 
-    int batch_size, int nheads, int seqlen, int head_dim)
+    int batch_size, int nheads, int seqlen, int head_dim,
+    int64_t batch_stride, int64_t token_stride, int64_t head_stride, int64_t dim_stride)
 {
     /*
     INPUTS:
@@ -72,12 +73,8 @@ __global__ void compute_attn_scores(
 
             for (int d = 0; d < head_dim; d++) { // FIX THIS LATER
 
-                uint32_t batch_stride = seqlen * nheads * head_dim;
-                uint32_t token_stride = nheads * head_dim;
-                uint32_t head_stride = head_dim;
-
-                uint32_t q_idx = batch_id * batch_stride + i * token_stride + head_id * head_stride + d;
-                uint32_t k_idx = batch_id * batch_stride + j * token_stride + head_id * head_stride + d;
+                uint32_t q_idx = batch_id * batch_stride + i * token_stride + head_id * head_stride + d * dim_stride;
+                uint32_t k_idx = batch_id * batch_stride + j * token_stride + head_id * head_stride + d * dim_stride;
 
                 num q_val = q[q_idx];
                 num k_val = k[k_idx];
@@ -92,8 +89,8 @@ __global__ void compute_attn_scores(
             uint32_t token_stride_out = seqlen;
             uint32_t o_idx = batch_id * batch_stride_out + head_id * head_stride_out + i * token_stride_out + j;
             scores[o_idx] = sum;
-            // scores[o_idx] += 1.0;
 
+            break;
         }
     }
 }
@@ -107,26 +104,33 @@ std::vector<torch::Tensor> launch_attention_forward(torch::Tensor q, torch::Tens
     int nheads = q.size(2);
     int head_dim = q.size(3);
 
+    int64_t batch_stride = q.stride(0);
+    int64_t seq_stride = q.stride(1);
+    int64_t head_stride = q.stride(2);
+    int64_t dim_stride = q.stride(3);
+
+
     // malloc output tensor
     num *out;
     uint32_t num_output_elements = batch_size * nheads * seqlen * seqlen;
     size_t output_size = num_output_elements * sizeof(num);
     CUDA_CHECK(cudaMalloc(&out, output_size));
-    std::cout << "malloc'd output_size = " << output_size << std::endl;
+    // printf("malloc'd output_size = %d bytes\n", num_output_elements);
+
 
     // launch kernel
-
     const uint32_t num_calls = batch_size * nheads;
     const uint32_t n_tiles_i = (seqlen + tile_dim - 1) / tile_dim;
     const uint32_t n_tiles_j = (seqlen + tile_dim - 1) / tile_dim;
     dim3 num_blocks = dim3(num_calls, n_tiles_i, n_tiles_j);
     dim3 thread_grid = dim3(num_threads_axis, num_threads_axis);
 
-    printf("launching kernel with num_blocks = (%d, %d, %d)\n", num_blocks.x, num_blocks.y, num_blocks.z);
+    // printf("launching kernel with num_blocks = (%d, %d, %d)\n", num_blocks.x, num_blocks.y, num_blocks.z);
     compute_attn_scores<<<num_blocks, thread_grid>>>(
         q.data_ptr<num>(), k.data_ptr<num>(), v.data_ptr<num>(), 
         out, 
-        batch_size, nheads, seqlen, head_dim);
+        batch_size, nheads, seqlen, head_dim,
+        batch_stride, seq_stride, head_stride, dim_stride);
     cudaDeviceSynchronize();
 
 

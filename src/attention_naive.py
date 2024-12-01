@@ -82,24 +82,79 @@ def attention_cuda(qkv):
     q, k, v = qkv.unbind(dim=2)
 
     # q, k, v are of shape (batch_size, seqlen, nheads, head_dim)
-    return cuda_extension.attention_forward(q, k, v)
+    output = cuda_extension.attention_forward(q, k, v)[0]
 
+    print(f"q.shape: {q.shape}")
+    print(f"q.stride(): {q.stride()}")
+    print(f"qkv.stride(): {qkv.stride()}")
+    print(f"cuda output.stride(): {output.stride()}")
+
+    return output
+
+def get_tensor_difference(t1, t2):
+    diff = (t1 - t2).to(float) # torch.quantile() doesn't work in bf16 :(
+    rtol = diff / t2
+    rtol = rtol.abs().flatten()
+    
+    print("========================")
+    print(">>>    rtol stats       ")
+    print(f"rtol(50%) = {torch.quantile(rtol, 0.5)}")
+    print(f"rtol(75%) = {torch.quantile(rtol, 0.75)}")
+    print(f"rtol(90%) = {torch.quantile(rtol, 0.90)}")
+    print(f"rtol(95%) = {torch.quantile(rtol, 0.95)}")
+    print(f"rtol(99%) = {torch.quantile(rtol, 0.99)}")
+
+def compute_relative_rmse(t1: torch.Tensor, t2: torch.Tensor) -> torch.Tensor:
+    """
+    t1 is ground truth
+    t2 is computed version
+    """
+    assert t1.shape == t2.shape, f"Tensor shapes must match: {t1.shape} != {t2.shape}"
+    
+    t1_flat = t1.reshape(-1)
+    t2_flat = t2.reshape(-1)
+    
+
+    diff = t1_flat - t2_flat
+    mse = torch.mean(diff * diff)
+    ref_mse = torch.mean(t1_flat * t1_flat)
+    
+    
+    rmse = torch.sqrt(mse)
+    ref_rmse = torch.sqrt(ref_mse)
+    rel_rmse = rmse / ref_rmse
+    
+    return rel_rmse
 
 if __name__ == "__main__":
 
-    batch_size = 1
+    batch_size = 2
     seqlen = 32
 
-    headdim = 4 # 64
-    nheads = 1 # 32
+    headdim = 64 # 64
+    nheads = 32 # 32
 
     dtype = torch.bfloat16
     qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim, dtype=dtype, device="cuda")
 
 
+    print("\n\n")
+    print("=================================================")
+    print("Computing batched Q @ K.T")
+    print("=================================================")
     torch_output = attention_torch_checkpoint(qkv)
     cuda_output = attention_cuda(qkv)
 
-    print(torch_output)
+    print(f"problem size:")
+    print(f"q/k/v shape = {(batch_size, seqlen, nheads, headdim)}")
+    
+    # print("torch_output (ground truth):")
+    # print(torch_output)
+    # print("cuda_output:")
+    # print(cuda_output)
 
-    print(cuda_output)
+    get_tensor_difference(torch_output, cuda_output)
+    
+    rel_rmse = compute_relative_rmse(torch_output, cuda_output)
+    print(f"\n\n>>> Relative RMSE: {rel_rmse}")
+
