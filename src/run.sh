@@ -17,7 +17,6 @@ echo "Content:"; ls
 # cd benchmarks
 # python3 benchmark_flash_attention.py
 
-python3 example.py
 
 printf "running attention_naive.py\n"
 python3 attention_naive.py

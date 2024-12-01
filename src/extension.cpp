@@ -2,8 +2,10 @@
 #include <vector>
 
 // Declaration of the kernel function (defined in extension_kernel.cu).
-std::vector<torch::Tensor> my_cuda_function(torch::Tensor input_tensor);
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("my_cuda_function", &my_cuda_function, "My CUDA Function");
+std::vector<torch::Tensor> launch_attention_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v);
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+{
+    m.def("attention_forward", &launch_attention_forward, "My CUDA Function");
 }
