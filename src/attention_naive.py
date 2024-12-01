@@ -53,9 +53,20 @@ def attention_pytorch(qkv, causal=True):
         # approach 2
         attn_scores = torch.einsum("b t h d, b s h d -> b h t s", q, k) * softmax_scale
 
-
     attention = torch.softmax(attn_scores, dim = -1) # softmax along key dimension
     output = torch.einsum("b h t s, b s h d -> b t h d", attention, v)
+
+    return output.to(dtype=qkv.dtype)
+
+def attention_torch_checkpoint(qkv):
+    attn_dtype, attn_device = qkv.dtype, qkv.device
+
+    batch_size, seqlen, _, nheads, d = qkv.shape
+    q, k, v = qkv.unbind(dim=2)
+    softmax_scale = 1.0 / math.sqrt(d)
+
+    attn_scores = torch.einsum("b t h d, b s h d -> b h t s", q, k) # * softmax_scale
+    output = attn_scores # for now
 
     return output.to(dtype=qkv.dtype)
 
@@ -69,20 +80,26 @@ def attention_cuda(qkv):
     """
     batch_size, seqlen, _, nheads, d = qkv.shape
     q, k, v = qkv.unbind(dim=2)
+
+    # q, k, v are of shape (batch_size, seqlen, nheads, head_dim)
     return cuda_extension.attention_forward(q, k, v)
 
 
 if __name__ == "__main__":
 
     batch_size = 1
-    seqlen = 4
+    seqlen = 32
 
-    headdim = 128
-    dim = 2048
-    nheads = dim // headdim
+    headdim = 4 # 64
+    nheads = 1 # 32
 
     dtype = torch.bfloat16
-    qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim, dtype=dtype)
-    output = attention_pytorch(qkv)
+    qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim, dtype=dtype, device="cuda")
 
-    print(f"output: {output}")
+
+    torch_output = attention_torch_checkpoint(qkv)
+    cuda_output = attention_cuda(qkv)
+
+    print(torch_output)
+
+    print(cuda_output)
