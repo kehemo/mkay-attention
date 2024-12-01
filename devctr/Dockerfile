@@ -11,3 +11,4 @@ RUN pip3 install torch --no-cache-dir
 RUN pip3 install numpy
 RUN pip3 install packaging ninja
 RUN pip3 install setuptools
+RUN pip3 install einops
