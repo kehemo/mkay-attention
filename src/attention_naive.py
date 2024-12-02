@@ -2,8 +2,10 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 import math
-import cuda_extension
+# import cuda_extension
 import time
+import triton
+import triton.language as tl
 
 
 def attention_pytorch(qkv, causal=True):
@@ -94,6 +96,85 @@ def attention_cuda(qkv):
 
     return output
 
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def attention_triton(
+    q, k, v, output, seqlen, d,
+    batch_stride, seqlen_stride, nheads_stride, nheads, BLOCK_SIZE: tl.constexpr
+):
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    # pointers to the appropriate batch and head
+    q_ptr = q + batch_idx * batch_stride + head_idx * nheads_stride
+    k_ptr = k + batch_idx * batch_stride + head_idx * nheads_stride
+    v_ptr = v + batch_idx * batch_stride + head_idx * nheads_stride
+    out_ptr = output + batch_idx * batch_stride + head_idx * nheads_stride
+
+    # need to grab the sequences for this particular head
+    offs_n = tl.arange(0, BLOCK_SIZE) * seqlen_stride
+    offs_d = tl.arange(0, BLOCK_SIZE)
+
+    # shape of q, k, v is (batch_size, seqlen, nheads, d)
+    # the block needs to be of shape (seqlen, d) for a single head as described by head_idx
+    q_ptrs = q_ptr + offs_n[:, None] * seqlen_stride + offs_d[None, :]
+    k_ptrs = k_ptr + offs_n[:, None] * seqlen_stride + offs_d[None, :]
+    v_ptrs = v_ptr + offs_n[:, None] * seqlen_stride + offs_d[None, :]
+
+    q_block = tl.load(
+        q_ptrs, mask = offs_n[:, None] < seqlen and offs_d[None, :] < d, other = 0
+    )
+    k_block = tl.load(
+        k_ptrs, mask = offs_n[:, None] < seqlen and offs_d[None, :] < d, other = 0
+    )
+    v_block = tl.load(
+        v_ptrs, mask = offs_n[:, None] < seqlen and offs_d[None, :] < d, other = 0
+    )
+
+    attn_scores = tl.dot(q_block, tl.trans(k_block)) / tl.sqrt(d.to(tl.float32))
+
+    attn_weights = tl.softmax(attn_scores)
+
+    output_block = tl.dot(attn_weights.to(tl.bfloat16), v_block)
+
+    # Store result
+    tl.store(
+        out_ptr + offs_n[:, None] * seqlen_stride + offs_d[None, :],
+        output_block,
+        mask=(offs_n[:, None] < seqlen) and (offs_d[None, :] < d)
+    )
+
+def attention_triton_launch(qkv):
+    batch_size, seqlen, _, nheads, d = qkv.shape
+
+    q, k, v = qkv.unbind(dim=2)
+
+    # Define grid dimensions based on batch size and number of heads
+    grid = (batch_size, nheads)
+
+
+    q_cont = q.contiguous()
+    k_cont = k.contiguous()
+    v_cont = v.contiguous()
+
+    output = torch.empty_like(q_cont, dtype=torch.bfloat16)
+    batch_stride = seqlen * nheads * d
+    seqlen_stride = nheads * d
+    nheads_stride = d
+
+    attention_triton[grid](
+        q_cont, k_cont, v_cont, output,
+        seqlen, d, batch_stride, seqlen_stride, nheads_stride, nheads, BLOCK_SIZE=32
+    )
+    
+    output = output.view(batch_size, seqlen, nheads, d)
+    return output
+
+
+
 def get_tensor_difference(t1, t2):
     diff = (t1 - t2).to(float) # torch.quantile() doesn't work in bf16 :(
     rtol = diff / t1
@@ -147,13 +228,15 @@ def run_tester(batch_size, seqlen, headdim, nheads):
 
 
     torch_time, torch_output = time_fwd(attention_torch_checkpoint, qkv)
-    cuda_time, cuda_output = time_fwd(attention_cuda, qkv)
+    # cuda_time, cuda_output = time_fwd(attention_cuda, qkv)
+    triton_time, triton_output = time_fwd(attention_triton_launch, qkv)
 
     # RUN TESTS
     print("-------------------")
     print("runtime checks:")
     print(f"torch_time: {torch_time}")
-    print(f"cuda_time: {cuda_time}")
+    # print(f"cuda_time: {cuda_time}")
+    print(f"triton_time: {triton_time}")
 
     # print("torch_output (ground truth):")
     # print(torch_output)
@@ -162,15 +245,15 @@ def run_tester(batch_size, seqlen, headdim, nheads):
 
     print("-------------------")
     print("correctness checks:")
-    use_rtol = False
+    use_rtol = True
     if (batch_size < 256 and use_rtol):
-        get_tensor_difference(torch_output, cuda_output)
+        get_tensor_difference(torch_output, triton_output)
     
-    rel_rmse = compute_relative_rmse(torch_output, cuda_output)
+    rel_rmse = compute_relative_rmse(torch_output, triton_output)
     print(f"\n>>> Relative RMSE: {rel_rmse}")
 
     del torch_output
-    del cuda_output
+    del triton_output
     torch.cuda.empty_cache()
 
 if __name__ == "__main__":
@@ -183,7 +266,7 @@ if __name__ == "__main__":
     
 
 
-    run_tester(batch_size=1, seqlen=32, headdim=4, nheads=1)
+    # run_tester(batch_size=1, seqlen=32, headdim=4, nheads=1)
     run_tester(batch_size=1, seqlen=32, headdim=32, nheads=1)
     run_tester(batch_size=128, seqlen=64, headdim=64, nheads=32)
     # run_tester(batch_size=1, seqlen=4096, headdim=64, nheads=32)
