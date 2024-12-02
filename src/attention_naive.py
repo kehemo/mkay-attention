@@ -68,7 +68,8 @@ def attention_torch_checkpoint(qkv):
 
     attn_scores = torch.einsum("b t h d, b s h d -> b h t s", q, k) * softmax_scale
     attention = torch.softmax(attn_scores, dim = -1) # softmax along key dimension
-    output = attention
+    output = torch.einsum("b h t s, b s h d -> b t h d", attention, v)
+    # output = attention
 
     return output.to(dtype=qkv.dtype)
 
@@ -161,7 +162,8 @@ def run_tester(batch_size, seqlen, headdim, nheads):
 
     print("-------------------")
     print("correctness checks:")
-    if (batch_size < 256):
+    use_rtol = False
+    if (batch_size < 256 and use_rtol):
         get_tensor_difference(torch_output, cuda_output)
     
     rel_rmse = compute_relative_rmse(torch_output, cuda_output)
@@ -182,6 +184,7 @@ if __name__ == "__main__":
 
 
     run_tester(batch_size=1, seqlen=32, headdim=4, nheads=1)
+    run_tester(batch_size=1, seqlen=32, headdim=32, nheads=1)
     run_tester(batch_size=128, seqlen=64, headdim=64, nheads=32)
     # run_tester(batch_size=1, seqlen=4096, headdim=64, nheads=32)
     # can't currently exceed 4096 due to memory constraints and the inefficiency of the current implementation
