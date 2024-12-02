@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 import math
 import cuda_extension
+import time
 
 
 def attention_pytorch(qkv, causal=True):
@@ -126,10 +127,17 @@ def compute_relative_rmse(t1: torch.Tensor, t2: torch.Tensor) -> torch.Tensor:
     
     return rel_rmse
 
+def time_fwd(attn_func, qkv):
+    time_start = time.time()
+    attn_output = attn_func(qkv)
+    time_end = time.time()
+    time_elapsed = time_end - time_start
+    return time_elapsed, attn_output
+
 if __name__ == "__main__":
 
-    batch_size = 2
-    seqlen = 32
+    batch_size = 8192
+    seqlen = 64
 
     headdim = 64 # 64
     nheads = 32 # 32
@@ -142,18 +150,23 @@ if __name__ == "__main__":
     print("=================================================")
     print("Computing batched Q @ K.T")
     print("=================================================")
-    torch_output = attention_torch_checkpoint(qkv)
-    cuda_output = attention_cuda(qkv)
+
+
+    torch_time, torch_output = time_fwd(attention_torch_checkpoint, qkv)
+    cuda_time, cuda_output = time_fwd(attention_cuda, qkv)
+
 
     print(f"problem size:")
     print(f"q/k/v shape = {(batch_size, seqlen, nheads, headdim)}")
-    
+    print(f"torch_time: {torch_time}")
+    print(f"cuda_time: {cuda_time}")
+
     # print("torch_output (ground truth):")
     # print(torch_output)
     # print("cuda_output:")
     # print(cuda_output)
 
-    get_tensor_difference(torch_output, cuda_output)
+    # get_tensor_difference(torch_output, cuda_output)
     
     rel_rmse = compute_relative_rmse(torch_output, cuda_output)
     print(f"\n\n>>> Relative RMSE: {rel_rmse}")
