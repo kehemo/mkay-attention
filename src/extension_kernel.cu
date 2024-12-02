@@ -25,7 +25,7 @@ std::vector<torch::Tensor> launch_attention_forward(torch::Tensor q, torch::Tens
     const uint32_t num_calls = batch_size * nheads;
     const uint32_t n_tiles_i = (seqlen + tile_dim - 1) / tile_dim;
     const uint32_t n_tiles_j = (seqlen + tile_dim - 1) / tile_dim;
-    dim3 num_blocks = dim3(num_calls, n_tiles_i, n_tiles_j);
+    dim3 num_blocks_k1 = dim3(num_calls, n_tiles_i, n_tiles_j);
     dim3 thread_grid = dim3(num_threads_axis, num_threads_axis);
 
     // printf("launching kernel with num_blocks = (%d, %d, %d)\n", num_blocks.x, num_blocks.y, num_blocks.z);
@@ -38,7 +38,7 @@ std::vector<torch::Tensor> launch_attention_forward(torch::Tensor q, torch::Tens
 
     // create output tensor
     auto options = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kBFloat16);
-    auto out_tensor = torch::from_blob(out, {batch_size, nheads, seqlen, seqlen}, options);
+    auto out_tensor = torch::from_blob(P, {batch_size, nheads, seqlen, seqlen}, options);
     return {out_tensor};
 }
 

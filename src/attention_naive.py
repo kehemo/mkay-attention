@@ -66,8 +66,9 @@ def attention_torch_checkpoint(qkv):
     q, k, v = qkv.unbind(dim=2)
     softmax_scale = 1.0 / math.sqrt(d)
 
-    attn_scores = torch.einsum("b t h d, b s h d -> b h t s", q, k) # * softmax_scale
-    output = attn_scores # for now
+    attn_scores = torch.einsum("b t h d, b s h d -> b h t s", q, k) * softmax_scale
+    attention = torch.softmax(attn_scores, dim = -1) # softmax along key dimension
+    output = attention
 
     return output.to(dtype=qkv.dtype)
 
@@ -136,7 +137,7 @@ def time_fwd(attn_func, qkv):
 
 if __name__ == "__main__":
 
-    batch_size = 8192
+    batch_size = 128
     seqlen = 64
 
     headdim = 64 # 64
@@ -166,7 +167,7 @@ if __name__ == "__main__":
     # print("cuda_output:")
     # print(cuda_output)
 
-    # get_tensor_difference(torch_output, cuda_output)
+    get_tensor_difference(torch_output, cuda_output)
     
     rel_rmse = compute_relative_rmse(torch_output, cuda_output)
     print(f"\n\n>>> Relative RMSE: {rel_rmse}")
