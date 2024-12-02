@@ -87,6 +87,21 @@ build_project() {
     tar -cvf build.tar -C ${BUILD_DIR} .
 }
 
+test() {
+    ensure_build_dir
+    # Build inside the container.
+    run_devctr \
+        --workdir "$CTR_SRC_DIR" \
+        -- \
+        ./build_test.sh
+    # Copy the run script.
+    cp ${SRC_DIR}/run_test.sh ${BUILD_DIR}/run.sh
+    # Make shippable tarball.
+    tar -cvf build.tar -C ${BUILD_DIR} .
+    JOB_ID="$(telerun submit build.tar | tee /dev/fd/2 | sed -nE 's/^.*submitted job ([0-9]*)$/\1/p')"
+    python src/check.py $JOB_ID
+}
+
 # Check if a function with the given name exists, and call it.
 if declare -f "$1" > /dev/null; then
     "$@"

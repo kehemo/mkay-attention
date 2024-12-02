@@ -4,3 +4,4 @@ telerun-out/
 .venv
 .devcontainer
 .vscode
+*.bin
