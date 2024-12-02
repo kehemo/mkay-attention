@@ -13,8 +13,10 @@ def attention_torch_checkpoint(qkv):
     q, k, v = qkv.unbind(dim=2)
     softmax_scale = 1.0 / math.sqrt(d)
 
-    attn_scores = torch.einsum("b t h d, b s h d -> b h t s", q, k)  # * softmax_scale
-    output = attn_scores  # for now
+    attn_scores = torch.einsum("b t h d, b s h d -> b h t s", q, k) * softmax_scale
+    attention = torch.softmax(attn_scores, dim=-1)  # softmax along key dimension
+    output = torch.einsum("b h t s, b s h d -> b t h d", attention, v)
+    # output = attention
 
     return output.to(dtype=qkv.dtype)
 
@@ -86,7 +88,7 @@ def check(batch_size, seqlen, nheads, headdim, run_id):
     print(f"problem size:")
     print(f"q/k/v shape = {(batch_size, seqlen, nheads, headdim)}")
     torch_output = attention_torch_checkpoint(qkv)
-    cuda_output = from_file(o_fname, dims=(batch_size, nheads, seqlen, seqlen))
+    cuda_output = from_file(o_fname, dims=(batch_size, seqlen, nheads, headdim))
     get_tensor_difference(torch_output, cuda_output)
 
     rel_rmse = compute_relative_rmse(torch_output, cuda_output)

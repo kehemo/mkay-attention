@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 import math
 import cuda_extension
+import time
 
 
 def attention_pytorch(qkv, causal=True):
@@ -65,8 +66,10 @@ def attention_torch_checkpoint(qkv):
     q, k, v = qkv.unbind(dim=2)
     softmax_scale = 1.0 / math.sqrt(d)
 
-    attn_scores = torch.einsum("b t h d, b s h d -> b h t s", q, k) # * softmax_scale
-    output = attn_scores # for now
+    attn_scores = torch.einsum("b t h d, b s h d -> b h t s", q, k) * softmax_scale
+    attention = torch.softmax(attn_scores, dim = -1) # softmax along key dimension
+    output = torch.einsum("b h t s, b s h d -> b t h d", attention, v)
+    # output = attention
 
     return output.to(dtype=qkv.dtype)
 
@@ -96,7 +99,6 @@ def get_tensor_difference(t1, t2):
     rtol = diff / t1
     rtol = rtol.abs().flatten()
     
-    print("========================")
     print(">>>    rtol stats       ")
     print(f"rtol(50%) = {torch.quantile(rtol, 0.5)}")
     print(f"rtol(75%) = {torch.quantile(rtol, 0.75)}")
@@ -126,35 +128,64 @@ def compute_relative_rmse(t1: torch.Tensor, t2: torch.Tensor) -> torch.Tensor:
     
     return rel_rmse
 
-if __name__ == "__main__":
+def time_fwd(attn_func, qkv):
+    time_start = time.time()
+    attn_output = attn_func(qkv)
+    time_end = time.time()
+    time_elapsed = time_end - time_start
+    return time_elapsed, attn_output
 
-    batch_size = 2
-    seqlen = 32
 
-    headdim = 64 # 64
-    nheads = 32 # 32
-
+def run_tester(batch_size, seqlen, headdim, nheads):
     dtype = torch.bfloat16
     qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim, dtype=dtype, device="cuda")
 
-
-    print("\n\n")
-    print("=================================================")
-    print("Computing batched Q @ K.T")
-    print("=================================================")
-    torch_output = attention_torch_checkpoint(qkv)
-    cuda_output = attention_cuda(qkv)
-
+    print("\n======================================")
     print(f"problem size:")
     print(f"q/k/v shape = {(batch_size, seqlen, nheads, headdim)}")
-    
+    assert seqlen % 32 == 0, "seqlen must be a multiple of 32 for tiling reasons"
+
+
+    torch_time, torch_output = time_fwd(attention_torch_checkpoint, qkv)
+    cuda_time, cuda_output = time_fwd(attention_cuda, qkv)
+
+    # RUN TESTS
+    print("-------------------")
+    print("runtime checks:")
+    print(f"torch_time: {torch_time}")
+    print(f"cuda_time: {cuda_time}")
+
     # print("torch_output (ground truth):")
     # print(torch_output)
     # print("cuda_output:")
     # print(cuda_output)
 
-    get_tensor_difference(torch_output, cuda_output)
+    print("-------------------")
+    print("correctness checks:")
+    use_rtol = False
+    if (batch_size < 256 and use_rtol):
+        get_tensor_difference(torch_output, cuda_output)
     
     rel_rmse = compute_relative_rmse(torch_output, cuda_output)
-    print(f"\n\n>>> Relative RMSE: {rel_rmse}")
+    print(f"\n>>> Relative RMSE: {rel_rmse}")
 
+    del torch_output
+    del cuda_output
+    torch.cuda.empty_cache()
+
+if __name__ == "__main__":
+
+    print("\n\n")
+    print("================================================================")
+    print("================================================================")
+    print("Computing batched Q @ K.T")
+    print("================================================================")
+    
+
+
+    run_tester(batch_size=1, seqlen=32, headdim=4, nheads=1)
+    run_tester(batch_size=1, seqlen=32, headdim=32, nheads=1)
+    run_tester(batch_size=128, seqlen=64, headdim=64, nheads=32)
+    # run_tester(batch_size=1, seqlen=4096, headdim=64, nheads=32)
+    # can't currently exceed 4096 due to memory constraints and the inefficiency of the current implementation
+    

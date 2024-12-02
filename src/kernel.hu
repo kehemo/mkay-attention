@@ -1,4 +1,6 @@
+#include <cuda_bf16.h>
 #pragma once
+
 void cuda_check(cudaError_t code, const char *file, int line)
 {
     if (code != cudaSuccess)
@@ -35,7 +37,7 @@ constexpr int tile_dim = 32;
 constexpr int num_threads_axis = 32;
 
 __global__ void compute_attn_scores(
-    num *q, const num *k, const num *v,
+    const num *q, const num *k, const num *v,
     num *scores,
     int batch_size, int nheads, int seqlen, int head_dim,
     int64_t batch_stride, int64_t token_stride, int64_t head_stride, int64_t dim_stride)
@@ -57,6 +59,7 @@ __global__ void compute_attn_scores(
     uint32_t tile_j = blockIdx.z;
     uint32_t thread_i = threadIdx.x;
     uint32_t thread_j = threadIdx.y;
+    num softmax_score = rsqrtf(head_dim);
 
     for (int row = thread_i; row < tile_dim; row += num_threads_axis)
     {
@@ -83,7 +86,119 @@ __global__ void compute_attn_scores(
             uint32_t head_stride_out = seqlen * seqlen;
             uint32_t token_stride_out = seqlen;
             uint32_t o_idx = batch_id * batch_stride_out + head_id * head_stride_out + i * token_stride_out + j;
-            scores[o_idx] = sum;
+            scores[o_idx] = sum * softmax_score;
+        }
+    }
+}
+
+__global__ void compute_attn_softmax(
+    const num *S,
+    num *P,
+    int batch_size, int nheads, int seqlen, int head_dim)
+{
+    /*
+    INPUTS:
+    S === (batch_size, nheads, seqlen, seqlen)
+        - attention scores (not softmaxed)
+    OUTPUTS:
+    P === (batch_size, nheads, seqlen, seqlen)
+        - attention scores (softmaxed)
+    */
+
+    uint32_t batch_stride_S = nheads * seqlen * seqlen;
+    uint32_t head_stride_S = seqlen * seqlen;
+    uint32_t token_stride_S = seqlen;
+
+    uint32_t batch_id = blockIdx.x;
+    uint32_t head_id = blockIdx.y;
+    uint32_t thread_id = threadIdx.x;
+    uint32_t num_threads = blockDim.x;
+
+    for (uint32_t query_id = thread_id; query_id < seqlen; query_id += num_threads)
+    {
+        // UHHH, we need a -inf for BF16, but i dont want to use -INFINITY in case of overflow or something
+        num max_el = -100.0;
+        for (uint32_t key_id = 0; key_id < seqlen; key_id++)
+        {
+            uint32_t s_idx = batch_id * batch_stride_S + head_id * head_stride_S + query_id * token_stride_S + key_id;
+            max_el = __hmax(max_el, S[s_idx]);
+        }
+
+        num sum = 0.0;
+        for (uint32_t key_id = 0; key_id < seqlen; key_id++)
+        {
+            uint32_t s_idx = batch_id * batch_stride_S + head_id * head_stride_S + query_id * token_stride_S + key_id;
+            P[s_idx] = hexp(S[s_idx] - max_el);
+            sum += P[s_idx];
+        }
+
+        for (uint32_t key_id = 0; key_id < seqlen; key_id++)
+        {
+            uint32_t s_idx = batch_id * batch_stride_S + head_id * head_stride_S + query_id * token_stride_S + key_id;
+            P[s_idx] /= sum;
+        }
+    }
+}
+
+constexpr uint32_t n_threads_seqlen_k3 = 32;
+constexpr uint32_t n_threads_head_dim_k3 = 4;
+constexpr uint32_t seqlen_tile_k3 = n_threads_seqlen_k3;
+constexpr uint32_t head_dim_tile_k3 = n_threads_head_dim_k3 * 4;
+__global__ void compute_attn_output(
+    const num *P, const num *V,
+    num *O,
+    int batch_size, int nheads, int seqlen, int head_dim,
+    int64_t batch_stride_qkv, int64_t token_stride_qkv, int64_t head_stride_qkv, int64_t dim_stride_qkv)
+{
+    /*
+    INPUTS:
+    P === (batch_size, nheads, seqlen, seqlen)
+        - attention scores (softmaxed)
+    V === (batch_size, seqlen, nheads, head_dim)
+        - values
+    OUTPUTS:
+    O === (batch_size, seqlen, nheads, head_dim)
+        - attention output
+    */
+
+    uint32_t block_id = blockIdx.x;
+    uint32_t batch_id = block_id / nheads;
+    uint32_t head_id = block_id % nheads;
+
+    uint32_t tile_seqlen = blockIdx.y;
+    uint32_t tile_head_dim = blockIdx.z;
+    uint32_t thread_seqlen = threadIdx.x;
+    uint32_t thread_head_dim = threadIdx.y;
+
+    for (int row = thread_seqlen; row < seqlen_tile_k3; row += n_threads_seqlen_k3)
+    {
+        for (int col = thread_head_dim; col < head_dim_tile_k3; col += n_threads_head_dim_k3)
+        {
+            num sum = 0.0;
+            int query_id = tile_seqlen * seqlen_tile_k3 + row;
+            int head_dim_id = tile_head_dim * head_dim_tile_k3 + col;
+
+            if (head_dim_id >= head_dim)
+            {
+                break;
+            }
+
+            uint32_t batch_stride_P = nheads * seqlen * seqlen;
+            uint32_t head_stride_P = seqlen * seqlen;
+            uint32_t token_stride_P = seqlen;
+
+            for (int key_id = 0; key_id < seqlen; key_id++)
+            {
+                uint32_t p_idx = batch_id * batch_stride_P + head_id * head_stride_P + query_id * token_stride_P + key_id;
+                uint32_t v_idx = batch_id * batch_stride_qkv + key_id * token_stride_qkv + head_id * head_stride_qkv + head_dim_id * dim_stride_qkv;
+                sum += P[p_idx] * V[v_idx];
+            }
+
+            uint32_t batch_stride_O = seqlen * nheads * head_dim;
+            uint32_t query_stride_O = nheads * head_dim;
+            uint32_t head_stride_O = head_dim;
+            uint32_t o_idx = batch_id * batch_stride_O + query_id * query_stride_O + head_id * head_stride_O + head_dim_id;
+            O[o_idx] = sum;
         }
     }
 }
