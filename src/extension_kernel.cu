@@ -1,6 +1,21 @@
 #include <torch/extension.h>
 #include <vector>
+#include <fstream>
+#include <iostream>
+#include <vector>
+#include <cstring>
+#include <cuda_runtime.h>
 
+// Method 1: Using ofstream directly
+bool writeToFile(const char* filename, const void* data, size_t size) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+
+    file.write(static_cast<const char*>(data), size);
+    return file.good();
+}
 void cuda_check(cudaError_t code, const char *file, int line)
 {
     if (code != cudaSuccess)
@@ -108,6 +123,25 @@ std::vector<torch::Tensor> launch_attention_forward(torch::Tensor q, torch::Tens
     int64_t head_stride = q.stride(2);
     int64_t dim_stride = q.stride(3);
 
+    size_t num_input_elements = batch_size * seqlen * nheads * head_dim;
+    printf("Looks like we have %0d * %0d * %0d * %0d = %0d input elements per tensor\n",
+        batch_size,
+        seqlen,
+        nheads,
+        head_dim,
+        num_input_elements
+    );
+
+    size_t input_size = num_input_elements * sizeof(num);
+    if (writeToFile("out/q.bin", &q, input_size)) {
+        std::cout << "Write Q successful\n";
+    }
+    if (writeToFile("out/k.bin", &k, input_size)) {
+        std::cout << "Write K successful\n";
+    }
+    if (writeToFile("out/v.bin", &v, input_size)) {
+        std::cout << "Write V successful\n";
+    }
 
     // malloc output tensor
     num *out;
@@ -132,6 +166,17 @@ std::vector<torch::Tensor> launch_attention_forward(torch::Tensor q, torch::Tens
         batch_stride, seq_stride, head_stride, dim_stride);
     cudaDeviceSynchronize();
 
+    num *out_cpu = (num*) malloc(output_size);
+    CUDA_CHECK(cudaMemcpy(
+        out_cpu,
+        out,
+        output_size,
+        cudaMemcpyDeviceToHost));
+    cudaDeviceSynchronize();
+
+    if (writeToFile("out/out.bin", &out_cpu, num_input_elements)) {
+        std::cout << "Write out.bin successful\n";
+    }
 
     // create output tensor
     auto options = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kBFloat16);
