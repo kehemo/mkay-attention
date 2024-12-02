@@ -98,7 +98,6 @@ def get_tensor_difference(t1, t2):
     rtol = diff / t1
     rtol = rtol.abs().flatten()
     
-    print("========================")
     print(">>>    rtol stats       ")
     print(f"rtol(50%) = {torch.quantile(rtol, 0.5)}")
     print(f"rtol(75%) = {torch.quantile(rtol, 0.75)}")
@@ -135,30 +134,23 @@ def time_fwd(attn_func, qkv):
     time_elapsed = time_end - time_start
     return time_elapsed, attn_output
 
-if __name__ == "__main__":
 
-    batch_size = 128
-    seqlen = 64
-
-    headdim = 64 # 64
-    nheads = 32 # 32
-
+def run_tester(batch_size, seqlen, headdim, nheads):
     dtype = torch.bfloat16
     qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim, dtype=dtype, device="cuda")
 
-
-    print("\n\n")
-    print("=================================================")
-    print("Computing batched Q @ K.T")
-    print("=================================================")
+    print("\n======================================")
+    print(f"problem size:")
+    print(f"q/k/v shape = {(batch_size, seqlen, nheads, headdim)}")
+    assert seqlen % 32 == 0, "seqlen must be a multiple of 32 for tiling reasons"
 
 
     torch_time, torch_output = time_fwd(attention_torch_checkpoint, qkv)
     cuda_time, cuda_output = time_fwd(attention_cuda, qkv)
 
-
-    print(f"problem size:")
-    print(f"q/k/v shape = {(batch_size, seqlen, nheads, headdim)}")
+    # RUN TESTS
+    print("-------------------")
+    print("runtime checks:")
     print(f"torch_time: {torch_time}")
     print(f"cuda_time: {cuda_time}")
 
@@ -167,8 +159,30 @@ if __name__ == "__main__":
     # print("cuda_output:")
     # print(cuda_output)
 
-    get_tensor_difference(torch_output, cuda_output)
+    print("-------------------")
+    print("correctness checks:")
+    if (batch_size < 256):
+        get_tensor_difference(torch_output, cuda_output)
     
     rel_rmse = compute_relative_rmse(torch_output, cuda_output)
-    print(f"\n\n>>> Relative RMSE: {rel_rmse}")
+    print(f"\n>>> Relative RMSE: {rel_rmse}")
 
+    del torch_output
+    del cuda_output
+    torch.cuda.empty_cache()
+
+if __name__ == "__main__":
+
+    print("\n\n")
+    print("================================================================")
+    print("================================================================")
+    print("Computing batched Q @ K.T")
+    print("================================================================")
+    
+
+
+    run_tester(batch_size=1, seqlen=32, headdim=4, nheads=1)
+    run_tester(batch_size=128, seqlen=64, headdim=64, nheads=32)
+    # run_tester(batch_size=1, seqlen=4096, headdim=64, nheads=32)
+    # can't currently exceed 4096 due to memory constraints and the inefficiency of the current implementation
+    
