@@ -8,38 +8,53 @@ import sys
 
 """
 Backward Pass Implementation Strategy:
-- Very liable to messing up a first pass correct implementation of the backward pass.
+- Very liable to messing up a first pass correct implementation of the backward pass
+  if only testing against the output dQKV
     - Also kind of tricky dealing with the batching and the multiple heads.
-- To help debug, we can use a hierarchy of slightly simpler implementations that can 
-  be tested against simpler ones (e.g., by comparing intermediate values), until we
-  have one that can be tested directly against the `.backward(g)` Pytorch builtin.
 
-Hierarchy of implementations
-- 
-
+- Other tests to try:
+    - Heads should be independent and batches should be independent. Could consider
+      using NaN propagation to see whether they are really being treated independently.
+        - I guess we could also try a test with one head and one batch first, and see if
+          the shapes work out.
 """
-sram_size_bytes = 100_000
 
-def fwd_reference(qkv):
+# FlashAttention takes as a parameter the size of the shared memory.
+sram_size_bytes = 100_000 # Could reduce for ease of testing.
+
+def attention_reference(qkv: torch.Tensor):
     attn_dtype, attn_device = qkv.dtype, qkv.device
 
     batch_size, seqlen, _, nheads, d = qkv.shape
     q, k, v = qkv.unbind(dim=2)
     softmax_scale = 1.0 / math.sqrt(d)
 
+    # S, P, O
     attn_scores = torch.einsum("b t h d, b s h d -> b h t s", q, k) * softmax_scale
     attention = torch.softmax(attn_scores, dim=-1)  # softmax along key dimension
     output = torch.einsum("b h t s, b s h d -> b t h d", attention, v)
-    # output = attention
 
-    # O, S, P
+    gradients = {}
+    def make_grad_hook(name):
+        def hook(grad):
+            gradients[name] = grad
+        return hook
+
+    handles = []  # We're supposed to clean them or something. Not sure if big deal.
+    handles.append(attn_scores.register_hook(make_grad_hook('delS')))
+    handles.append(attention.register_hook(make_grad_hook('delP')))
+
+    # (last one is actually not quite dO in the sense of the paper, which is really dPhi/dO)
+    handles.append(output.register_hook(make_grad_hook('delO')))
+
     # O: b t h d
     # S: b h t s (but s is pre-softmax)
     # P: b h t s
-    return output.to(dtype=qkv.dtype), attn_scores, attention
+    # gradients is empty until we call `.backward(g)`
+    return output.to(dtype=qkv.dtype), attn_scores, attention, gradients, handles
 
 def attention_torch_checkpoint(qkv):
-    output, *_ = fwd_reference(qkv)
+    output, *_ = attention_reference(qkv)
     return output
 
 # Pytorch implementation of the naive backward pass.
@@ -52,7 +67,7 @@ def bwd_expanded(
         p: torch.Tensor,
         g: torch.Tensor):
     qkv = qkv.detach().clone().requires_grad_(True)
-    o, s, p = fwd_reference(qkv)
+    o, s, p = attention_reference(qkv)
     q, k, v = qkv.unbind(dim=2)
     
     dV = p.T @ g  # g is dO
@@ -66,21 +81,21 @@ def bwd_expanded(
     dS = torch.einsum("", )
     raise NotImplementedError
 
-def test_bwd_expanded(qkv: torch.Tensor):
-    qkv = qkv.detach().clone().requires_grad_(True)
+# def test_bwd_expanded(qkv: torch.Tensor):
+#     qkv = qkv.detach().clone().requires_grad_(True)
 
-    o, s, p = fwd_reference(qkv)  # Technically a waste of computation.
-    g = torch.randn_like(o)  # Fake loss function
-    qkv.backward(g)
+#     o, s, p = attention_reference(qkv)  # Technically a waste of computation.
+#     g = torch.randn_like(o)  # Fake loss function
+#     qkv.backward(g)
 
-    ref = qkv.grad
+#     ref = qkv.grad
 
-    # Note for later versions we can also start extracting intermediate results.
-    expanded = bwd_expanded(qkv, o, s, p, g)
+#     # Note for later versions we can also start extracting intermediate results.
+#     expanded = bwd_expanded(qkv, o, s, p, g)
 
-    get_tensor_difference(ref, expanded)
-    rel_rmse = compute_relative_rmse(ref, expanded)
-    print(f"\n\n>>> Relative RMSE: {rel_rmse}")
+#     get_tensor_difference(ref, expanded)
+#     rel_rmse = compute_relative_rmse(ref, expanded)
+#     print(f"\n\n>>> Relative RMSE: {rel_rmse}")
 
 # Pytorch implementation of the FlashAttention backward pass.
 # - can *test against* the `bwd_expanded` with intermediate values.
@@ -190,21 +205,75 @@ def check(batch_size, seqlen, nheads, headdim, run_id):
     k_fname = f"{prefix}_k.bin"
     v_fname = f"{prefix}_v.bin"
     q, k, v = map(from_file, [q_fname, k_fname, v_fname])
-    qkv = torch.stack((q, k, v), dim=2)
+    qkv = torch.stack((q, k, v), dim=2).requires_grad_(True)
 
     print("\n\n")
     print("=================================================")
     print("Computing batched Q @ K.T")
     print("=================================================")
     print(f"problem size:")
-    print(f"q/k/v shape = {(batch_size, seqlen, nheads, headdim)}")
-    torch_output = attention_torch_checkpoint(qkv)
+    print(f"q/k/v shape (b s h d) = {(batch_size, seqlen, nheads, headdim)}")
+    torch_output, scores, partials, gradients, handles = attention_reference(qkv)
+
     cuda_output = from_file(o_fname, dims=(batch_size, seqlen, nheads, headdim))
     get_tensor_difference(torch_output, cuda_output)
 
     rel_rmse = compute_relative_rmse(torch_output, cuda_output)
     print(f"\n\n>>> Relative RMSE: {rel_rmse}")
 
+    print('\n')
+    print("Testing backwards pass on torch")
+    print(f"Output shape {torch_output.shape}")
+    g = torch.randn_like(torch_output)
+    torch_output.backward(g)
+
+    # Print a small sample of a tensor.
+    def print_sample(n: str, grad):
+        approx = grad[:, 0, 0, 0]
+        print(f"{n} shape {grad.shape}: {approx}")
+
+    print_sample('O', torch_output)
+    print_sample('S', scores)
+    print_sample('P', partials)  # P: (b, s, h(our head), k(target head)) (todo check)
+    # dS, dP, dO
+    for n, grad in gradients.items():
+        print_sample(n, grad)
+
+    print("And finally: Given from autograd")
+    d_name = ('dQ', 'dK', 'dV')
+    dqkv= qkv.grad.unbind(dim=2)
+
+    # dq, dk, dv
+    for i in range(3):
+        n = d_name[i]
+        grad = dqkv[i]
+        print_sample(n, grad)
+
+    print("Our derivation:")
+    # dO in the paper is really dPhi/delO
+    # Note that we don't test this directly, but indirectly via the dQKV
+    dO = g * gradients['delO']
+    print_sample('dO?', dO)
+
+    # This is a little tricky.
+    # dV = P^T dO
+    try_dV = torch.einsum("b s h k, b k s d -> b h s d", partials, dO)
+    print_sample('dV?', try_dV)
+
+    # # dP = dO V^T
+    # try_dP = torch.einsum("", dO, v)
+    
+    # # dS = uhhh look in the paper
+    # try_dS = 
+    # print_sample('dS?', try_dS)
+
+    # # dQ = dS K
+    # print_sample('dK?', try_dQ)
+    # # dK = dS^T Q
+    # print_sample('dQ?', try_dK)
+
+    for handle in handles:
+        handle.remove()
 
 run_id = sys.argv[1]
 check(2, 32, 64, 32, run_id)
