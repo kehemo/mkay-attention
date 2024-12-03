@@ -2,6 +2,11 @@
 #include <vector>
 #include "kernel.hu"
 
+num *get_data_ptr(torch::Tensor tensor)
+{
+    return reinterpret_cast<num *>(tensor.data_ptr<at::BFloat16>());
+}
+
 std::vector<torch::Tensor> launch_attention_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v)
 {
     int batch_size = q.size(0);
@@ -37,7 +42,7 @@ std::vector<torch::Tensor> launch_attention_forward(torch::Tensor q, torch::Tens
 
     // printf("launching kernel with num_blocks = (%d, %d, %d)\n", num_blocks.x, num_blocks.y, num_blocks.z);
     compute_attn_scores<<<num_blocks_k1, thread_dim_k1>>>(
-        q.data_ptr<num>(), k.data_ptr<num>(), v.data_ptr<num>(),
+        get_data_ptr(q), get_data_ptr(k), get_data_ptr(v),
         S,
         batch_size, nheads, seqlen, head_dim,
         batch_stride_qkv, seq_stride_qkv, head_stride_qkv, dim_stride_qkv);
@@ -61,7 +66,7 @@ std::vector<torch::Tensor> launch_attention_forward(torch::Tensor q, torch::Tens
     dim3 thread_dim_k3 = dim3(num_threads_axis, num_threads_axis);
 
     compute_attn_output<<<num_blocks_k3, thread_dim_k3>>>(
-        P, v.data_ptr<num>(),
+        P, get_data_ptr(v),
         O,
         batch_size, nheads, seqlen, head_dim,
         batch_stride_qkv, seq_stride_qkv, head_stride_qkv, dim_stride_qkv);

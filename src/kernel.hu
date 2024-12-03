@@ -1,4 +1,16 @@
 #include <cuda_bf16.h>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cuda_runtime.h>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <random>
+#include <string>
+#include <vector>
 #pragma once
 
 void cuda_check(cudaError_t code, const char *file, int line)
@@ -59,14 +71,14 @@ __global__ void compute_attn_scores(
     uint32_t tile_j = blockIdx.z;
     uint32_t thread_i = threadIdx.x;
     uint32_t thread_j = threadIdx.y;
-    num softmax_score = rsqrtf(head_dim);
+    num softmax_score = hrsqrt(__int2bfloat16_rd(head_dim));
 
     for (int row = thread_i; row < tile_dim; row += num_threads_axis)
     {
         for (int col = thread_j; col < tile_dim; col += num_threads_axis)
         {
             // compute "score[i][j] = sum_k q[i][d] * k[j][d]"
-            num sum = 0.0;
+            num sum = __float2bfloat16(0.0);
             int i = tile_i * tile_dim + row;
             int j = tile_j * tile_dim + col;
 
@@ -117,14 +129,14 @@ __global__ void compute_attn_softmax(
     for (uint32_t query_id = thread_id; query_id < seqlen; query_id += num_threads)
     {
         // UHHH, we need a -inf for BF16, but i dont want to use -INFINITY in case of overflow or something
-        num max_el = -100.0;
+        num max_el = __float2bfloat16(-100.0);
         for (uint32_t key_id = 0; key_id < seqlen; key_id++)
         {
             uint32_t s_idx = batch_id * batch_stride_S + head_id * head_stride_S + query_id * token_stride_S + key_id;
             max_el = __hmax(max_el, S[s_idx]);
         }
 
-        num sum = 0.0;
+        num sum = __float2bfloat16(0.0);
         for (uint32_t key_id = 0; key_id < seqlen; key_id++)
         {
             uint32_t s_idx = batch_id * batch_stride_S + head_id * head_stride_S + query_id * token_stride_S + key_id;
@@ -174,7 +186,7 @@ __global__ void compute_attn_output(
     {
         for (int col = thread_head_dim; col < head_dim_tile_k3; col += n_threads_head_dim_k3)
         {
-            num sum = 0.0;
+            num sum = __float2bfloat16(0.0);
             int query_id = tile_seqlen * seqlen_tile_k3 + row;
             int head_dim_id = tile_head_dim * head_dim_tile_k3 + col;
 
