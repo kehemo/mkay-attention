@@ -45,7 +45,7 @@ def attention_reference(qkv: torch.Tensor):
     handles.append(attention.register_hook(make_grad_hook('delP')))
 
     # (last one is actually not quite dO in the sense of the paper, which is really dPhi/dO)
-    handles.append(output.register_hook(make_grad_hook('delO')))
+    handles.append(output.register_hook(make_grad_hook('fake_delO')))
 
     # O: b t h d
     # S: b h t s (but s is pre-softmax)
@@ -250,21 +250,26 @@ def check(batch_size, seqlen, nheads, headdim, run_id):
         print_sample(n, grad)
 
     print("Our derivation:")
-    # dO in the paper is really dPhi/delO
-    # Note that we don't test this directly, but indirectly via the dQKV
-    dO = g * gradients['delO']
-    print_sample('dO?', dO)
 
-    # This is a little tricky.
+    dO: torch.Tensor = g  # Just randomly generated lol
+
+    # shapes = {  # For reference
+    #     'qo': "bthd",
+    #     'kv': "bshd",
+    #     'sp': "bhts"
+    # }
+
+    # This is a little tricky
     # dV = P^T dO
-    try_dV = torch.einsum("b s h k, b k s d -> b h s d", partials, dO)
+    try_dV = torch.einsum("b h t s, b t h d -> b s h d", partials, dO)
     print_sample('dV?', try_dV)
 
     # # dP = dO V^T
-    # try_dP = torch.einsum("", dO, v)
-    
+    try_dP = torch.einsum("bthd, bshd -> bhts", dO, v)
+    print_sample('dP?', try_dP)
+
     # # dS = uhhh look in the paper
-    # try_dS = 
+    # try_dS =
     # print_sample('dS?', try_dS)
 
     # # dQ = dS K
