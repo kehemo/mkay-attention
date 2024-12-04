@@ -273,8 +273,11 @@ def check(batch_size, seqlen, nheads, headdim, run_id):
     # print_sample('dS?', try_dS)
 
     # # dQ = dS K
+    # try_dQ = torch.einsum("bhts, bshd -> bthd", dS, k)
     # print_sample('dK?', try_dQ)
+
     # # dK = dS^T Q
+    # try_dK = torch.einsum("bhts, bthd -> bshd", dS, q)
     # print_sample('dQ?', try_dK)
 
     for handle in handles:
