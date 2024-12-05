@@ -47,12 +47,29 @@ def flash_backward_model(Q, K, V, S, P, O, dO):
     Ks = (b, T_c, B_c, h d) 
     Vs = (b, T_c, B_c, h d)
     """
-    print("Shapes of the block-divided tensors (Step 3)")
+    print("(Step 3) Shapes of the block-divided QKV")
     print(f"T_r = {T_r}, T_c = {T_c}, B_r = {B_r}, B_c = {B_c}")
     print(Qs.shape)
     print(Ks.shape)
     print(Vs.shape)
 
+    # Step 4 (Incomplete)
+    Os = rearrange(q, 'b (g t) h d -> b g t h d', g=T_r, t=B_r)
+    dOs = rearrange(q, 'b (g t) h d -> b g t h d', g=T_r, t=B_r)
+    # need statistic generation
+    # ls
+    # ms
+    """
+    Os  = (b, T_r, B_r, h d)
+    dOs = (b, T_r, B_r, h d)
+    ls  = (b, T_r, B_r, h)  # Reduced across d already
+    ms  = (b, T_r, B_r, h)
+    """
+    print("(Step 4) Shapes of block-divided O, dOs, ls, ms")
+    print(Os.shape)
+    print(dOs.shape)
+    # print(ls.shape)
+    # print(ms.shape)
     # Step 5
     dQs = torch.zeros_like(Qs)
     dKs = torch.zeros_like(Ks)
