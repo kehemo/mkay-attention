@@ -29,9 +29,9 @@ def generate_statistics(Q, K):
     softmax_scale = 1.0 / math.sqrt(d)
     S = torch.einsum("b t h d, b s h d -> b h t s", Q, K) * softmax_scale
     # max over d of bthd
-    m = S.max(-1, keepdim=True).values  # b t h 1
-    P_ = torch.exp(S - m) # b t h s
-    l = P_.sum(-1, keepdim=True)  # b t h 1
+    m = S.max(-1, keepdim=True).values  # b h t 1
+    P_ = torch.exp(S - m) # b h t s
+    l = P_.sum(-1, keepdim=True)  # b h t 1
 
     print(f"Shape of m is {m.shape} and l is {l.shape}")
     return l, m
@@ -48,7 +48,7 @@ def flash_backward_model(Q, K, V, S, P, O, dO, l, m):
     batch_size, seqlen, nheads, d = Q.shape
 
     # Stopgap: should really be generating these from the forward pass
-    l, m = generate_statistics(Q, K)  # b t h 1
+    l, m = generate_statistics(Q, K)  # b h t 1
 
     B_c = math.ceil(sram_size_bytes / (4 * d))
     B_r = min(B_c, d)
@@ -75,21 +75,21 @@ def flash_backward_model(Q, K, V, S, P, O, dO, l, m):
     print(Vs.shape)
 
     # Step 4 (Incomplete)
-    Os = rearrange(q, 'b (g t) h d -> b g t h d', g=T_r, t=B_r)
-    dOs = rearrange(q, 'b (g t) h d -> b g t h d', g=T_r, t=B_r)
+    Os = rearrange(O, 'b (g t) h d -> b g t h d', g=T_r, t=B_r)
+    dOs = rearrange(dO, 'b (g t) h d -> b g t h d', g=T_r, t=B_r)
     # need statistic generation
-    # ls
-    # ms
+    ls = rearrange(l, "b h (g t) 1 -> b h g t 1", g=T_r, t=B_r)
+    ms = rearrange(m, "b h (g t) 1 -> b h g t 1", g=T_r, t=B_r)
     """
-    Os  = (b, T_r, B_r, h d)
-    ls  = (b, T_r, B_r, h)  # Reduced across d already
-    ms  = (b, T_r, B_r, h)
+    Os  = (b, T_r, B_r, h, d)
+    ls  = (b, T_r, B_r, h, 1)  # Reduced across d already
+    ms  = (b, T_r, B_r, h, 1)
     """
     print("(Step 4) Shapes of block-divided O, dOs, ls, ms")
     print(Os.shape)
     print(dOs.shape)
-    # print(ls.shape)
-    # print(ms.shape)
+    print(ls.shape)
+    print(ms.shape)
     # Step 5
     dQs = torch.zeros_like(Qs)
     dKs = torch.zeros_like(Ks)
