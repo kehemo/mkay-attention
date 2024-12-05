@@ -3,6 +3,7 @@ import torch
 import math
 
 # Ensure your q, k, v tensors are initialized
+sram_size_bytes = 1000  # Test value, real is 100K, but this lets us split 128 seqlen into T_r, B_r
 batch_size, seq_len, num_heads, head_dim = 16, 128, 4, 32  # Example dimensions
 q = torch.randn(batch_size, seq_len, num_heads, head_dim, requires_grad=True)
 k = torch.randn(batch_size, seq_len, num_heads, head_dim, requires_grad=True)
@@ -15,6 +16,76 @@ def naive_forward(Q, K, V):
     P = torch.softmax(S, dim=-1)  # Softmax along the key dimension
     O = torch.einsum("b h t s, b s h d -> b t h d", P, V)
     return S, P, O
+
+def flash_forward_model(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor):
+    print("Running flash forward model")
+    batch_size, seqlen, nheads, d = Q.shape
+    print(f"Parameters: b = {batch_size}, t/s = {seq_len}, h = {nheads}, d={d}")
+    softmax_scale = 1.0 / math.sqrt(d)
+
+    B_c = math.ceil(sram_size_bytes / (4 * d))
+    B_r = min(B_c, d)
+
+    T_r = math.ceil(seqlen / B_r)  # Not affected by num heads or batch_size
+    T_c = math.ceil(seqlen / B_c)
+
+    assert seqlen == T_r * B_r, f"N ({seqlen}) must equal T_r * B_r ({T_r * B_r})"
+
+    # Step 3
+    Qs = rearrange(q, 'b (g t) h d -> b g t h d', g=T_r, t=B_r)
+    Ks = rearrange(k, 'b (g s) h d -> b g s h d', g=T_c, s=B_c)
+    Vs = rearrange(v, 'b (g s) h d -> b g s h d', g=T_c, s=B_c)
+    """
+    where T is the number of blocks, and B is block size (B_r for t, B_c for s)
+    Qs = (b, T_r, B_r, h d)
+    Ks = (b, T_c, B_c, h d)
+    Vs = (b, T_c, B_c, h d)
+    """
+    print("(Step 3) Shapes of the block-divided QKV")
+    print(f"T_r = {T_r}, T_c = {T_c}, B_r = {B_r}, B_c = {B_c}")
+    print(Qs.shape)
+    print(Ks.shape)
+    print(Vs.shape)
+
+    lm_shape = q.shape[:-1]
+    # lm_shape = (q.shape[0], q.shape[1], q.shape[2], 1)
+    O = torch.zeros_like(Q)
+    l = torch.zeros(lm_shape)
+    m = torch.full(lm_shape, float('-inf'))
+
+    print("Shapes of O, l, m")
+    print(O.shape)
+    print(l.shape)
+    print(m.shape)
+
+    # Step 4 (Incomplete)
+    Os = rearrange(O, 'b (g t) h d -> b g t h d', g=T_r, t=B_r)
+    # need statistic generation
+    ls = rearrange(l, "b (g t) h -> b g t h", g=T_r, t=B_r)
+    ms = rearrange(m, "b (g t) h -> b g t h", g=T_r, t=B_r)
+    """
+    Os  = (b, T_r, B_r, h, d)
+    ls  = (b, T_r, B_r, h)  # Reduced across d already
+    ms  = (b, T_r, B_r, h)
+    """
+    print("(Step 4) Shapes of block-divided O, dOs, ls, ms")
+    print(Os.shape)
+    print(ls.shape)
+    print(ms.shape)
+    # Step 5
+
+
+
+    for j in range(T_c):
+        for j in range(T_r):
+            pass
+            # This stuff is actually supposed to happen in different blocks, but we're
+            # doing all of them simultaneously here.
+            # S_ = softmax_scale * torch.einsum("b, ", Q, K)
+
+    raise NotImplementedError
+
+    return O, l, m
 
 """
 To properly implement the backward pass, we need access to the l, m statistics from the
@@ -36,6 +107,15 @@ def generate_statistics(Q, K):
     print(f"Shape of m is {m.shape} and l is {l.shape}")
     return l, m
 
+# def check_statistics(Q, K, V):
+#     l, m = generate_statistics(Q, K)
+#     S, P, O = naive_forward(Q, K, V)
+
+#     # Now, it should be that softmax(x) = f(x) / l(x), where
+#     # f(x) = exp(x - m)
+#     # l(x) = sum of f(x)
+#     try_P =
+
 def flash_backward_model(Q, K, V, S, P, O, dO, l, m):
     
     """
@@ -44,8 +124,8 @@ def flash_backward_model(Q, K, V, S, P, O, dO, l, m):
     P = (b, h, t, s)
     O = (b, t, h, d)
     """
-    sram_size_bytes = 1000  # Test value, real is 100K
     batch_size, seqlen, nheads, d = Q.shape
+    softmax_scale = 1.0 / math.sqrt(d)
 
     # Stopgap: should really be generating these from the forward pass
     l, m = generate_statistics(Q, K)  # b h t 1
@@ -95,14 +175,16 @@ def flash_backward_model(Q, K, V, S, P, O, dO, l, m):
     dKs = torch.zeros_like(Ks)
     dVs = torch.zeros_like(Vs)
 
-    raise NotImplementedError
 
     for j in range(T_c):
         dKw = torch.zeros_like(Ks) # I don't know convention for the swiggle on top
         dVw = torch.zeros_like(Vs)
         for j in range(T_r):
-            s = torch.einsum("")
+            # This stuff is actually supposed to happen in different blocks, but we're
+            # doing all of them simultaneously here.
+            S_ = softmax_scale * torch.einsum("b, ", Q, K)
 
+    raise NotImplementedError
     dV = torch.einsum("b h t s, b t h d -> b s h d", P, dO)
     dP = torch.einsum("b t h d, b s h d -> b h t s", dO, V)
      
@@ -146,5 +228,5 @@ torch_dS = _grads[1]
 L.backward()  # Backpropagate to compute gradients
 
 
-
-flash_backward_model(q,k,v, S,P,O, torch_dO, None, None)
+flash_forward_model(q, k, v)
+# flash_backward_model(q,k,v, S,P,O, torch_dO, None, None)
