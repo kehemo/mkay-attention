@@ -16,7 +16,16 @@ def naive_forward(Q, K, V):
     O = torch.einsum("b h t s, b s h d -> b t h d", P, V)
     return S, P, O
 
-def flash_backward_model(Q, K, V, S, P, O, dO):
+"""
+To properly implement the backward pass, we need access to the l, m statistics from the
+FlashAttention forward pass. We generate these separately for testing, though these should
+correspond to the real thing.
+"""
+def generate_statistics(Q, K, V):
+    l, m = None
+    return l, m
+
+def flash_backward_model(Q, K, V, S, P, O, dO, l, m):
     
     """
     Q,K,V = (b, t/s, h, d)
@@ -61,7 +70,6 @@ def flash_backward_model(Q, K, V, S, P, O, dO):
     # ms
     """
     Os  = (b, T_r, B_r, h d)
-    dOs = (b, T_r, B_r, h d)
     ls  = (b, T_r, B_r, h)  # Reduced across d already
     ms  = (b, T_r, B_r, h)
     """
@@ -75,11 +83,14 @@ def flash_backward_model(Q, K, V, S, P, O, dO):
     dKs = torch.zeros_like(Ks)
     dVs = torch.zeros_like(Vs)
 
+    raise NotImplementedError
+
     for j in range(T_c):
         dKw = torch.zeros_like(Ks) # I don't know convention for the swiggle on top
         dVw = torch.zeros_like(Vs)
         for j in range(T_r):
             s = torch.einsum("")
+
     dV = torch.einsum("b h t s, b t h d -> b s h d", P, dO)
     dP = torch.einsum("b t h d, b s h d -> b h t s", dO, V)
      
@@ -124,4 +135,4 @@ L.backward()  # Backpropagate to compute gradients
 
 
 
-flash_backward_model(q,k,v, S,P,O, torch_dO)
+flash_backward_model(q,k,v, S,P,O, torch_dO, None, None)
