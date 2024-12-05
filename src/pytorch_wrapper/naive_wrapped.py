@@ -1,5 +1,6 @@
 import torch 
 from typing import Optional, Sequence, Tuple, Union
+import math
 
 def force_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
@@ -15,43 +16,64 @@ csrc/flash_attn/flash_api.cpp to see the official cuda version api
 
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_forward", mutates_args=(), device_types="cuda")
-def _flash_attn_forward(
+# @_torch_custom_op_wrapper("flash_attn::_flash_attn_forward", mutates_args=(), device_types="cuda")
+def _naive_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     
     q, k, v = [force_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse = flash_attn_cuda.fwd(q,k,v,)
-    return out, softmax_lse
+
+    # IMPLEMENTATION STARTS
+    d = q.shape[-1]
+    softmax_scale = 1.0 / math.sqrt(d)
+    S = torch.einsum("b t h d, b s h d -> b h t s", q, k) * softmax_scale
+    P = torch.softmax(S, dim=-1)  # softmax along key dimension
+    O = torch.einsum("b h t s, b s h d -> b t h d", P, v)
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
-def _flash_attn_backward(
-    dout: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    out: torch.Tensor,
-    softmax_lse: torch.Tensor,
-    dq: Optional[torch.Tensor],
-    dk: Optional[torch.Tensor],
-    dv: Optional[torch.Tensor],
-) -> torch.Tensor:
-    # dq, dk, dv are allocated by us so they should already be contiguous
-    dout, q, k, v, out = [force_contiguous(x) for x in (dout, q, k, v, out)]
-    dq,dk,dv,softmax_d = flash_attn_cuda.bwd( dout, q, k, v, out, softmax_lse, dq, dk, dv,)
-    return softmax_d
+    # IMPLEMENTATION ENDS
+    return S, P, O
 
 
 
+# @_torch_custom_op_wrapper("flash_attn::_flash_attn_backward", mutates_args=(), device_types="cuda")
+def _naive_attn_backward(
+    dO: torch.Tensor,
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    S: torch.Tensor,
+    P: torch.Tensor,
+    O: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
-_wrapped_flash_attn_forward = _flash_attn_forward
-_wrapped_flash_attn_backward = _flash_attn_backward
+    # IMPLEMENTATION STARTS
+
+    dV = torch.einsum("b h t s, b t h d -> b s h d", P, dO)
+    dP = torch.einsum("b t h d, b s h d -> b h t s", dO, V)
+     
+    t = (P * dP).sum(axis = -1)[:,:,:,None]
+    dS = P * (dP - t)
+
+    d = Q.shape[-1]
+    softmax_scale = 1.0 / math.sqrt(d)
+    
+    dQ = torch.einsum("b h t s, b s h d -> b t h d", dS, K) * softmax_scale
+    dK = torch.einsum("b h t s, b t h d -> b s h d", dS, Q) * softmax_scale
+
+    # IMPLEMENTATION ENDS
+
+    return dQ, dK, dV
 
 
-class MKAY_AttnQKVPackedFunc(torch.autograd.Function):
+
+_wrapped_naive_attn_forward = _naive_attn_forward
+_wrapped_naive_attn_backward = _naive_attn_backward
+
+
+class naive_AttnQKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx,qkv): 
         softmax_scale = qkv.shape[-1] ** (-0.5)
@@ -60,22 +82,25 @@ class MKAY_AttnQKVPackedFunc(torch.autograd.Function):
         B, N, H, D = q.shape
         assert (D % 8 == 0), "head dimension must be divisible by 8"
 
-        out, softmax_lse =  _wrapped_flash_attn_forward(q,k,v,)
-        ctx.save_for_backward(q, k, v, out, softmax_lse)
-        return out
+        S, P, O =  _wrapped_naive_attn_forward(q,k,v,)
+        ctx.save_for_backward(q, k, v, S, P, O)
+        return O
     
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse= ctx.saved_tensors
+        q, k, v, S, P, O = ctx.saved_tensors
         B, N, H, D = q.shape
-        qkv_shape = (B, N, H, 3, D)
+        qkv_shape = (B, N, 3, H, D)
 
 
         dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
         assert (D % 8 == 0), "head dimension must be divisible by 8"
             
-        _wrapped_flash_attn_backward(dout,q,k,v,out,softmax_lse,dqkv[:, :, 0],dqkv[:, :, 1],dqkv[:, :, 2],)
-        dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
+        dQ,dK,dV = _wrapped_naive_attn_backward(dout, q, k, v, S, P, O,)
+        dqkv[:, :, 0] = dQ
+        dqkv[:, :, 1] = dK
+        dqkv[:, :, 2] = dV
         
+
         # you will need to return (,None) x (number of arguments in forward besides qkv that don't need gradients!)
         return dqkv
