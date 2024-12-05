@@ -21,8 +21,19 @@ To properly implement the backward pass, we need access to the l, m statistics f
 FlashAttention forward pass. We generate these separately for testing, though these should
 correspond to the real thing.
 """
-def generate_statistics(Q, K, V):
-    l, m = None
+def generate_statistics(Q, K):
+    """
+    m is a function of S and is the max across the `d` dimension.
+    """
+    d = Q.shape[-1]
+    softmax_scale = 1.0 / math.sqrt(d)
+    S = torch.einsum("b t h d, b s h d -> b h t s", Q, K) * softmax_scale
+    # max over d of bthd
+    m = S.max(-1, keepdim=True).values  # b t h 1
+    P_ = torch.exp(S - m) # b t h s
+    l = P_.sum(-1, keepdim=True)  # b t h 1
+
+    print(f"Shape of m is {m.shape} and l is {l.shape}")
     return l, m
 
 def flash_backward_model(Q, K, V, S, P, O, dO, l, m):
@@ -36,7 +47,8 @@ def flash_backward_model(Q, K, V, S, P, O, dO, l, m):
     sram_size_bytes = 1000  # Test value, real is 100K
     batch_size, seqlen, nheads, d = Q.shape
 
-    l, m = 0, 0  # TODO need to fill in.
+    # Stopgap: should really be generating these from the forward pass
+    l, m = generate_statistics(Q, K)  # b t h 1
 
     B_c = math.ceil(sram_size_bytes / (4 * d))
     B_r = min(B_c, d)
