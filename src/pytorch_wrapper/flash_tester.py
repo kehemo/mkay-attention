@@ -1,3 +1,4 @@
+from einops import rearrange
 import torch
 import math
 
@@ -15,7 +16,7 @@ def naive_forward(Q, K, V):
     O = torch.einsum("b h t s, b s h d -> b t h d", P, V)
     return S, P, O
 
-def naive_backward(Q, K, V, S, P, O, dO):
+def flash_backward_model(Q, K, V, S, P, O, dO):
     
     """
     Q,K,V = (b, t/s, h, d)
@@ -23,7 +24,45 @@ def naive_backward(Q, K, V, S, P, O, dO):
     P = (b, h, t, s)
     O = (b, t, h, d)
     """
-    
+    sram_size_bytes = 1000  # Test value, real is 100K
+    batch_size, seqlen, nheads, d = Q.shape
+
+    l, m = 0, 0  # TODO need to fill in.
+
+    B_c = math.ceil(sram_size_bytes / (4 * d))
+    B_r = min(B_c, d)
+
+    T_r = math.ceil(seqlen / B_r)  # Not affected by num heads or batch_size
+    T_c = math.ceil(seqlen / B_c)
+
+    assert seqlen == T_r * B_r, f"N ({seqlen}) must equal T_r * B_r ({T_r * B_r})"
+
+    # Step 3
+    Qs = rearrange(q, 'b (g t) h d -> b g t h d', g=T_r, t=B_r)
+    Ks = rearrange(k, 'b (g s) h d -> b g s h d', g=T_c, s=B_c)
+    Vs = rearrange(v, 'b (g s) h d -> b g s h d', g=T_c, s=B_c)
+    """
+    where T is the number of blocks, and B is block size (B_r for t, B_c for s)
+    Qs = (b, T_r, B_r, h d)
+    Ks = (b, T_c, B_c, h d) 
+    Vs = (b, T_c, B_c, h d)
+    """
+    print("Shapes of the block-divided tensors (Step 3)")
+    print(f"T_r = {T_r}, T_c = {T_c}, B_r = {B_r}, B_c = {B_c}")
+    print(Qs.shape)
+    print(Ks.shape)
+    print(Vs.shape)
+
+    # Step 5
+    dQs = torch.zeros_like(Qs)
+    dKs = torch.zeros_like(Ks)
+    dVs = torch.zeros_like(Vs)
+
+    for j in range(T_c):
+        dKw = torch.zeros_like(Ks) # I don't know convention for the swiggle on top
+        dVw = torch.zeros_like(Vs)
+        for j in range(T_r):
+            s = torch.einsum("")
     dV = torch.einsum("b h t s, b t h d -> b s h d", P, dO)
     dP = torch.einsum("b t h d, b s h d -> b h t s", dO, V)
      
@@ -68,4 +107,4 @@ L.backward()  # Backpropagate to compute gradients
 
 
 
-naive_backward(q,k,v, S,P,O, torch_dO)
+flash_backward_model(q,k,v, S,P,O, torch_dO)
