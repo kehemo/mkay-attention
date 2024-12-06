@@ -50,8 +50,8 @@ def flash_forward_model(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor):
     lm_shape = q.shape[:-1]
     # lm_shape = (q.shape[0], q.shape[1], q.shape[2], 1)
     O = torch.zeros_like(Q)
-    l = torch.zeros(lm_shape)
-    m = torch.full(lm_shape, float('-inf'))
+    l = torch.zeros(lm_shape).unsqueeze(3)
+    m = torch.full(lm_shape, float('-inf')).unsqueeze(3)
 
     print("Shapes of O, l, m")
     print(O.shape)
@@ -59,26 +59,53 @@ def flash_forward_model(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor):
     print(m.shape)
 
     # Step 4 (Incomplete)
-    Os = rearrange(O, 'b (g t) h d -> b g t h d', g=T_r, t=B_r)
+    Os = rearrange(O, 'b (g t) h d -> b g h t d', g=T_r, t=B_r)
     # need statistic generation
-    ls = rearrange(l, "b (g t) h -> b g t h", g=T_r, t=B_r)
-    ms = rearrange(m, "b (g t) h -> b g t h", g=T_r, t=B_r)
+    ls = rearrange(l, "b (g t) h 1 -> b g h t 1", g=T_r, t=B_r)
+    ms = rearrange(m, "b (g t) h 1 -> b g h t 1", g=T_r, t=B_r)
     """
-    Os  = (b, T_r, B_r, h, d)
-    ls  = (b, T_r, B_r, h)  # Reduced across d already
-    ms  = (b, T_r, B_r, h)
+    Os  = (b, T_r, h, B_r, d)
+    ls  = (b, T_r, h, B_r, 1)  # Reduced across d already
+    ms  = (b, T_r, h, B_r, 1)
     """
-    print("(Step 4) Shapes of block-divided O, dOs, ls, ms")
+    print("(Step 4) Shapes of block-divided O, ls, ms")
     print(Os.shape)
     print(ls.shape)
     print(ms.shape)
     # Step 5
 
-
-
+    # Note about data layout. You may want to do this differently in CUDA. This is just
+    # to get things started. You may want to e.g., change the l, m layouts.
     for j in range(T_c):
-        for j in range(T_r):
-            pass
+        # Select for particular group
+        K_j = Ks[:, j, :, :, :]
+        V_j = Vs[:, j, :, :, :]
+        for i in range(T_r):
+            Q_i = Qs[:, i, :, :, :]
+            O_i = Os[:, i, :, :, :]
+            l_i = ls[:, i, :, :, :]
+            m_i = ms[:, i, :, :, :]
+
+            S_ij = softmax_scale * torch.einsum("bthd, bshd -> bhts", Q_i, K_j)  # Step 10
+            m_ij = S_ij.max(-1, keepdim=True).values  # bht1
+            if i == 0 and j == 0:
+                print("Inner loop shapes")
+                print(f"S_ij {S_ij.shape}")
+                print(f"m {m_i.shape}")
+            P_ij = torch.exp(S_ij - m_ij)
+            l_ij = P_ij.sum(-1, keepdim=True)
+
+            if i == 0 and j == 0:
+                print("m shapes")
+                print(f"m_ij {m_ij.shape}, m_i {m_i.shape}")
+            m_new = torch.maximum(m_ij, m_i)
+            l_new = torch.exp(m_i - m_new) * torch.exp(m_ij - m_new) * l_ij
+
+            # lol this one's a little trickier, step 15 bro
+            # O_i[:] =
+
+            m_i[:] = m_new
+            l_i[:] = l_new
             # This stuff is actually supposed to happen in different blocks, but we're
             # doing all of them simultaneously here.
             # S_ = softmax_scale * torch.einsum("b, ", Q, K)
@@ -212,20 +239,20 @@ def flash_backward_model(Q, K, V, S, P, O, dO, l, m):
     return dQ, dK, dV
 
 # Compute attention output
-S, P, O = naive_forward(q, k, v)
+# S, P, O = naive_forward(q, k, v)
 
-# Scalar L computation (example: sum of all elements of O)
-O_sum = O.sum()
-L = O_sum * O_sum
+# # Scalar L computation (example: sum of all elements of O)
+# O_sum = O.sum()
+# L = O_sum * O_sum
 
 
-_grads = torch.autograd.grad(L, [O,S], retain_graph=True) # len 1 list
-torch_dO = _grads[0]
-torch_dS = _grads[1]
+# _grads = torch.autograd.grad(L, [O,S], retain_graph=True) # len 1 list
+# torch_dO = _grads[0]
+# torch_dS = _grads[1]
 
 
 # Compute gradients
-L.backward()  # Backpropagate to compute gradients
+# L.backward()  # Backpropagate to compute gradients
 
 
 flash_forward_model(q, k, v)
