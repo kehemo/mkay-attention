@@ -41,11 +41,15 @@ def flash_forward_model(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor):
     Ks = (b, T_c, B_c, h d)
     Vs = (b, T_c, B_c, h d)
     """
+
+    def name_shape(n, t):
+        print(f"{n}: {t.shape}")
+
     print("(Step 3) Shapes of the block-divided QKV")
     print(f"T_r = {T_r}, T_c = {T_c}, B_r = {B_r}, B_c = {B_c}")
-    print(Qs.shape)
-    print(Ks.shape)
-    print(Vs.shape)
+    name_shape("Qs", Qs)
+    name_shape("Ks", Ks)
+    name_shape("Vs", Vs)
 
     lm_shape = q.shape[:-1]
     # lm_shape = (q.shape[0], q.shape[1], q.shape[2], 1)
@@ -54,9 +58,9 @@ def flash_forward_model(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor):
     m = torch.full(lm_shape, float('-inf')).unsqueeze(3)
 
     print("Shapes of O, l, m")
-    print(O.shape)
-    print(l.shape)
-    print(m.shape)
+    name_shape("O", O)
+    name_shape("l", l)
+    name_shape("m", m)
 
     # Step 4 (Incomplete)
     Os = rearrange(O, 'b (g t) h d -> b g h t d', g=T_r, t=B_r)
@@ -69,9 +73,9 @@ def flash_forward_model(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor):
     ms  = (b, T_r, h, B_r, 1)
     """
     print("(Step 4) Shapes of block-divided O, ls, ms")
-    print(Os.shape)
-    print(ls.shape)
-    print(ms.shape)
+    name_shape("Os", Os)
+    name_shape("ls", ls)
+    name_shape("ms", ms)
     # Step 5
 
     # Note about data layout. You may want to do this differently in CUDA. This is just
@@ -84,20 +88,19 @@ def flash_forward_model(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor):
             Q_i = Qs[:, i, :, :, :]
             O_i = Os[:, i, :, :, :]
             l_i = ls[:, i, :, :, :]
-            m_i = ms[:, i, :, :, :]
+            m_i = ms[:, i, :, :, :]  # Should be updated every iteration
 
             S_ij = softmax_scale * torch.einsum("bthd, bshd -> bhts", Q_i, K_j)  # Step 10
             m_ij = S_ij.max(-1, keepdim=True).values  # bht1
             if i == 0 and j == 0:
                 print("Inner loop shapes")
-                print(f"S_ij {S_ij.shape}")
-                print(f"m {m_i.shape}")
+                name_shape("S_ij", S_ij)
             P_ij = torch.exp(S_ij - m_ij)
             l_ij = P_ij.sum(-1, keepdim=True)
 
             if i == 0 and j == 0:
-                print("m shapes")
-                print(f"m_ij {m_ij.shape}, m_i {m_i.shape}")
+                name_shape("m_ij", m_ij)
+                name_shape("l_ij", l_ij)
             m_new = torch.maximum(m_ij, m_i)
             l_new = torch.exp(m_i - m_new) * torch.exp(m_ij - m_new) * l_ij
 
