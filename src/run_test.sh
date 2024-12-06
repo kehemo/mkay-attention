@@ -9,3 +9,4 @@
 # ----------------------------------------------------------------------------------
 
 ./kernel
+python3 triton_implementation/triton_check.py

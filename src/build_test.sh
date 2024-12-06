@@ -25,4 +25,6 @@ export TORCH_CUDA_ARCH_LIST='8.6'
 
 # Copy example.
 cp test*.bin ${CTR_BUILD_DIR}/
+cp check.py ${CTR_BUILD_DIR}/
+cp triton_implementation -r ${CTR_BUILD_DIR}/
 nvcc -O3 kernel_raw.cu -o ${CTR_BUILD_DIR}/kernel

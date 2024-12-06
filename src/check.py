@@ -4,6 +4,7 @@ import math
 from einops import rearrange
 from ctypes import *
 import sys
+from triton_implementation import *
 
 
 def attention_torch_checkpoint(qkv):
@@ -60,27 +61,26 @@ file_path = os.path.realpath(__file__)
 script_dir = os.path.dirname(file_path)
 telerun_dir = os.path.join(script_dir, "..", "telerun-out")
 
-
-def check(batch_size, seqlen, nheads, headdim, run_id):
-
-    dtype = torch.bfloat16
-
-    def from_file(fname, dims=(batch_size, seqlen, nheads, headdim)):
+def from_file(fname, dtype, dims):
         with open(fname, "rb") as f:
             data = f.read()
             buf = (c_char * len(data)).from_buffer_copy(data)
             return torch.frombuffer(buf, dtype=dtype).reshape(dims)
 
+def check(batch_size, seqlen, nheads, headdim, run_id):
+
+    dtype = torch.bfloat16
+
     test_name = f"test_{batch_size}x{seqlen}x{nheads}x{headdim}"
     prefix = os.path.join(script_dir, test_name)
 
     o_fname = os.path.join(telerun_dir, run_id, f"{test_name}_o.bin")
+    triton_o_fname = os.path.join(telerun_dir, run_id, f"triton_{test_name}_o.bin")
     q_fname = f"{prefix}_q.bin"
     k_fname = f"{prefix}_k.bin"
     v_fname = f"{prefix}_v.bin"
-    q, k, v = map(from_file, [q_fname, k_fname, v_fname])
+    q, k, v = map(lambda filename: from_file(filename, dtype, dims = (batch_size, seqlen, nheads, headdim)), [q_fname, k_fname, v_fname])
     qkv = torch.stack((q, k, v), dim=2)
-
     print("\n\n")
     print("=================================================")
     print("Computing batched Q @ K.T")
@@ -88,12 +88,19 @@ def check(batch_size, seqlen, nheads, headdim, run_id):
     print(f"problem size:")
     print(f"q/k/v shape = {(batch_size, seqlen, nheads, headdim)}")
     torch_output = attention_torch_checkpoint(qkv)
-    cuda_output = from_file(o_fname, dims=(batch_size, seqlen, nheads, headdim))
-    get_tensor_difference(torch_output, cuda_output)
+    cuda_output = from_file(o_fname, dtype, dims=(batch_size, seqlen, nheads, headdim))
+    triton_output = from_file(triton_o_fname, dtype = torch.float32, dims=(batch_size, seqlen, nheads, headdim))
+    triton_output = triton_output.to(dtype=torch.bfloat16)
 
+    print("CUDA output compared to Torch output:")
+    get_tensor_difference(torch_output, cuda_output)
     rel_rmse = compute_relative_rmse(torch_output, cuda_output)
     print(f"\n\n>>> Relative RMSE: {rel_rmse}")
 
+    print("Triton output compared to Torch output:")
+    get_tensor_difference(torch_output, triton_output)
+    rel_rmse = compute_relative_rmse(torch_output, triton_output)
+    print(f"\n\n>>> Relative RMSE: {rel_rmse}")
 
 run_id = sys.argv[1]
 check(2, 32, 64, 32, run_id)
