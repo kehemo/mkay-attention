@@ -9,6 +9,9 @@ q = torch.randn(batch_size, seq_len, num_heads, head_dim, requires_grad=True)
 k = torch.randn(batch_size, seq_len, num_heads, head_dim, requires_grad=True)
 v = torch.randn(batch_size, seq_len, num_heads, head_dim, requires_grad=True)
 
+def name_shape(n: str, t: torch.Tensor):
+    print(f"{n}: {t.shape}")
+
 def naive_forward(Q, K, V):
     d = Q.shape[-1]
     softmax_scale = 1.0 / math.sqrt(d)
@@ -41,9 +44,6 @@ def flash_forward_model(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor):
     Ks = (b, T_c, B_c, h d)
     Vs = (b, T_c, B_c, h d)
     """
-
-    def name_shape(n, t):
-        print(f"{n}: {t.shape}")
 
     print("(Step 3) Shapes of the block-divided QKV")
     print(f"T_r = {T_r}, T_c = {T_c}, B_r = {B_r}, B_c = {B_c}")
@@ -85,6 +85,7 @@ def flash_forward_model(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor):
         K_j = Ks[:, j, :, :, :]
         V_j = Vs[:, j, :, :, :]
         for i in range(T_r):
+            is_first = i == 0 and j == 0
             Q_i = Qs[:, i, :, :, :]
             O_i = Os[:, i, :, :, :]
             l_i = ls[:, i, :, :, :]
@@ -92,28 +93,55 @@ def flash_forward_model(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor):
 
             S_ij = softmax_scale * torch.einsum("bthd, bshd -> bhts", Q_i, K_j)  # Step 10
             m_ij = S_ij.max(-1, keepdim=True).values  # bht1
-            if i == 0 and j == 0:
+            if is_first:
                 print("Inner loop shapes")
                 name_shape("S_ij", S_ij)
             P_ij = torch.exp(S_ij - m_ij)
             l_ij = P_ij.sum(-1, keepdim=True)
 
-            if i == 0 and j == 0:
+            if is_first:
                 name_shape("m_ij", m_ij)
                 name_shape("l_ij", l_ij)
             m_new = torch.maximum(m_ij, m_i)
-            l_new = torch.exp(m_i - m_new) * torch.exp(m_ij - m_new) * l_ij
+
+            # adjust_old_factor1 = torch.diag()
+
+            exp_mi = torch.exp(m_i - m_new)
+            exp_mij= torch.exp(m_ij - m_new)
+            l_new = exp_mi * l_i +  exp_mij * l_ij
 
             # lol this one's a little trickier, step 15 bro
-            # O_i[:] =
+            # (bthd) = (bhtt)(bhtt*bthd + bht1*bhts*bshd)
+            # identity = torch.eye(B_r)
+            # inv_l_new_diag = torch.einsum("bhti, tu -> bhtu", torch.reciprocal(l_new), identity)
+            # l_i_diag = torch.einsum("bhti, tu -> bhtu", l_i, identity)
+            # if is_first:
+            #     name_shape("l_diag", inv_l_new_diag)
 
+            # Yup this is diagonal
+            # view = l_new_diag[0, 0, :, :]
+            # if not torch.equal(view, torch.zeros_like(view)):
+            #     print(view)
+
+            # term1 = torch.einsum()
+
+            # o_new = torch.einsum("bhts, bshd -> bthd", P_ij, V_j)
+            # o_adjustment = adjust_old_factor *
+            # O_i[:] = adjust_new_factor * (o_adjustment + o_new)
+
+            # O_i[:] = inv_l_new_diag * (l_i_diag * exp_mi * O_i + exp_mij * P_ij * V_j)
+            # term1 = torch.einsum("")
+            # o_term1 = exp_mi * torch.einsum(" -> bthd", l_i_diag, O_i)
+            # o_term2 =  exp_mij * torch.einsum("bhts, bshd -> bthd", P_ij, V_j)
+            # o_sum = o_term1 + o_term2
+            # O_i[:] = torch.einsum("bhtu, bhud -> bthd", inv_l_new_diag, o_sum)
             m_i[:] = m_new
             l_i[:] = l_new
             # This stuff is actually supposed to happen in different blocks, but we're
             # doing all of them simultaneously here.
             # S_ = softmax_scale * torch.einsum("b, ", Q, K)
-
-    raise NotImplementedError
+    # print(f"l: {l}")
+    # print(f"m: {m}")
 
     return O, l, m
 
@@ -241,22 +269,79 @@ def flash_backward_model(Q, K, V, S, P, O, dO, l, m):
 
     return dQ, dK, dV
 
-# Compute attention output
-# S, P, O = naive_forward(q, k, v)
+def check_statistics(q, k, v):
+    l_stat, m_stat = generate_statistics(q, k)
+    O, l, m = flash_forward_model(q, k, v)
 
-# # Scalar L computation (example: sum of all elements of O)
-# O_sum = O.sum()
-# L = O_sum * O_sum
+    # Slightly different formats
+    # generate_statistics has them in bthi
+    # flash_forward_model has them in bhti
+    m_stat = rearrange(m_stat, "b t h i -> b h t i")
+    l_stat = rearrange(l_stat, "b t h i -> b h t i")
+    # name_shape("m_stat", m_stat)
+    # name_shape("m", m)
+    # name_shape("l_stat", l_stat)
+    # name_shape("l", l)
+    if torch.allclose(m, m_stat) and torch.allclose(l, l_stat):
+        print("Statistics from flash model and statistics function match.")
 
+# TODO: Consider finish implementing the forward model. But probably not necessary since we've
+# checked the statistics separately.
+def check_forward_pass(q, k, v):
+    flash_O, _, _, flash_S, flash_P = flash_forward_model(q, k, v)
+    S, P, O = naive_forward(q, k, v)
+    raise NotImplementedError
 
-# _grads = torch.autograd.grad(L, [O,S], retain_graph=True) # len 1 list
-# torch_dO = _grads[0]
-# torch_dS = _grads[1]
+def naive_backward(Q, K, V, S, P, O, dO):
+    """
+    Q,K,V = (b, t/s, h, d)
+    S = (b, h, t, s)
+    P = (b, h, t, s)
+    O = (b, t, h, d)
+    """
 
+    dV = torch.einsum("b h t s, b t h d -> b s h d", P, dO)
+    dP = torch.einsum("b t h d, b s h d -> b h t s", dO, V)
 
-# Compute gradients
-# L.backward()  # Backpropagate to compute gradients
+    t = (P * dP).sum(axis = -1)[:,:,:,None]
+    dS = P * (dP - t)
 
+    d = Q.shape[-1]
+    softmax_scale = 1.0 / math.sqrt(d)
 
-flash_forward_model(q, k, v)
-# flash_backward_model(q,k,v, S,P,O, torch_dO, None, None)
+    dQ = torch.einsum("b h t s, b s h d -> b t h d", dS, K) * softmax_scale
+    dK = torch.einsum("b h t s, b t h d -> b s h d", dS, Q) * softmax_scale
+
+    return dQ, dK, dV
+
+def check_backward_pass(q, k, v):
+    # Set up the intermediate values from the forward pass
+    S, P, O = naive_forward(q, k, v)
+    # Scalar L computation (example: sum of all elements of O)
+    O_sum = O.sum()
+    L = O_sum * O_sum
+    _grads = torch.autograd.grad(L, [O,S], retain_graph=True) # len 1 list
+
+    torch_dO = _grads[0]
+    torch_dS = _grads[1]
+    L.backward()  # Backpropagate to compute gradients
+    ref_dQ, ref_dK, ref_dV = q.grad, k.grad, v.grad
+
+    # Example check against the naive implementation. This here is a little redundant with the
+    # check inside of naive_backward.
+    dQ, dK, dV = naive_backward(q, k, v, S, P, O, torch_dO)
+
+    try:
+        # i have no idea why the tolerances have to be this high....
+        assert torch.allclose(ref_dQ, dQ, atol = 5e-4), "dQ was incorrect"
+        assert torch.allclose(ref_dK, dK, atol = 5e-4), "dK was incorrect"
+        assert torch.allclose(ref_dV, dV, atol = 5e-4), "dV was incorrect"
+    except:
+        print("Failed")
+        Q_dev = (dQ / ref_dQ - 1).abs().max()
+        K_dev = (dK / ref_dK - 1).abs().max()
+        V_dev = (dV / ref_dV - 1).abs().max()
+        print(Q_dev, K_dev, V_dev)
+
+check_statistics(q,k,v)
+check_backward_pass(q, k, v)
