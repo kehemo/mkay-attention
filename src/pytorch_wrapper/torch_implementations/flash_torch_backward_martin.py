@@ -69,7 +69,7 @@ def check_backward(Q, K, V, dO, softmax_scale):
     check_tensor("dQ", naive_dQ, f_dQ)
     check_tensor("dK", naive_dK, f_dK)
     check_tensor("dV", naive_dV, f_dV)
-    print("All pass")
+    print("Backward check complete")
 
 def flash_forward(Q, K, V, softmax_scale = 1.0):
     """
@@ -207,7 +207,7 @@ def flash_backward(Q, K, V, O, dO, l, m, softmax_scale):
             dQi[:] = dQi + dSij @ Kj * softmax_scale
 
             # Step 22
-            dKj[:] = dKj + dSij @ Qi * softmax_scale
+            dKj[:] = dKj + dSij.T @ Qi * softmax_scale
 
     return dQ, dK, dV, dS, dP, S, P # for debugging
 
