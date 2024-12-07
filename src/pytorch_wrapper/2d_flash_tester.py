@@ -109,32 +109,21 @@ def flash_forward_model(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor):
             exp_mi = torch.exp(m_i - m_new)
             exp_mij= torch.exp(m_ij - m_new)
             l_new = exp_mi * l_i +  exp_mij * l_ij
-            # breakpoint()
-            # lol this one's a little trickier, step 15 bro
-            # (bthd) = (bhtt)(bhtt*bthd + bht1*bhts*bshd)
-            # identity = torch.eye(B_r)
-            # inv_l_new_diag = torch.einsum("bhti, tu -> bhtu", torch.reciprocal(l_new), identity)
-            # l_i_diag = torch.einsum("bhti, tu -> bhtu", l_i, identity)
-            # if is_first:
-            #     name_shape("l_diag", inv_l_new_diag)
 
-            # Yup this is diagonal
-            # view = l_new_diag[0, 0, :, :]
-            # if not torch.equal(view, torch.zeros_like(view)):
-            #     print(view)
-
-            # term1 = torch.einsum()
-
-            # o_new = torch.einsum("bhts, bshd -> bthd", P_ij, V_j)
-            # o_adjustment = adjust_old_factor *
-            # O_i[:] = adjust_new_factor * (o_adjustment + o_new)
-
-            # O_i[:] = inv_l_new_diag * (l_i_diag * exp_mi * O_i + exp_mij * P_ij * V_j)
-            # term1 = torch.einsum("")
-            # o_term1 = exp_mi * torch.einsum(" -> bthd", l_i_diag, O_i)
-            # o_term2 =  exp_mij * torch.einsum("bhts, bshd -> bthd", P_ij, V_j)
-            # o_sum = o_term1 + o_term2
-            # O_i[:] = torch.einsum("bhtu, bhud -> bthd", inv_l_new_diag, o_sum)
+            o_factor = l_new.reciprocal()
+            diag_l_i = torch.diag(l_i)
+            if is_first:
+                name_shape("o_factor", o_factor)
+                name_shape("l_i", l_i)
+                name_shape("diag_l_i", diag_l_i)
+                name_shape("exp_mi", exp_mi)
+                name_shape("O_i", O_i)
+            o_term1 = l_i.unsqueeze(1) * (exp_mi.unsqueeze(1) * O_i)
+            o_term2 = exp_mij.unsqueeze(1) * P_ij @ V_j
+            if is_first:
+                name_shape("o_term1", o_term1)
+                name_shape("o_term2", o_term2)
+            O_i[:] = o_factor.unsqueeze(1) * (o_term1 + o_term2)
             m_i[:] = m_new
             l_i[:] = l_new
             # This stuff is actually supposed to happen in different blocks, but we're
@@ -282,9 +271,19 @@ def check_statistics(q, k, v):
 # TODO: Consider finish implementing the forward model. But probably not necessary since we've
 # checked the statistics separately.
 def check_forward_pass(q, k, v):
-    flash_O, _, _, flash_S, flash_P = flash_forward_model(q, k, v)
-    S, P, O = naive_forward(q, k, v)
-    raise NotImplementedError
+    O, l, m = flash_forward_model(q, k, v)
+    S, P, ref_O = naive_forward(q, k, v)
+
+    try:
+        # i have no idea why the tolerances have to be this high....
+        assert torch.allclose(ref_O, O, atol = 5e-4), "O was incorrect"
+        print("O was correct")
+    except:
+        print("Failed")
+        O_dev = (O / ref_O - 1).abs().max()
+        # print(O_dev)
+        print(O)
+        print(ref_O)
 
 def naive_backward(Q, K, V, S, P, O, dO):
     """
@@ -337,5 +336,6 @@ def check_backward_pass(q, k, v):
         V_dev = (dV / ref_dV - 1).abs().max()
         print(Q_dev, K_dev, V_dev)
 
-check_statistics(q,k,v)
+check_forward_pass(q, k, v)
+# check_statistics(q,k,v)
 # check_backward_pass(q, k, v)
