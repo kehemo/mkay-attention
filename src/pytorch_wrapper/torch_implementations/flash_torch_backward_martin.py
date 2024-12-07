@@ -58,7 +58,7 @@ def check_backward(Q, K, V, dO, softmax_scale):
     # Didn't check "P" because naive_P and flash_P are different formats, kinda
     check_tensor("O", naive_O, flash_O)
 
-    f_out = flash_backward(Q, K, V, dO, l, m, softmax_scale)
+    f_out = flash_backward(Q, K, V, flash_O, dO, l, m, softmax_scale)
     f_dQ, f_dK, f_dV, f_dS, f_dP, f_bS, f_bP = f_out
 
     check_tensor("bS", naive_S, f_bS)  # Check the S is reconstructed correctly
@@ -132,7 +132,7 @@ def flash_forward(Q, K, V, softmax_scale = 1.0):
     return S, O, l, m
 
 
-def flash_backward(Q, K, V, dO, l, m, softmax_scale):
+def flash_backward(Q, K, V, O, dO, l, m, softmax_scale):
     """
     Q,K,V: (N,d)
     """
@@ -150,7 +150,6 @@ def flash_backward(Q, K, V, dO, l, m, softmax_scale):
     dS = torch.zeros(N, N)
     dP = torch.zeros(N, N)
 
-    O = torch.zeros(N, d)
     S = torch.zeros(N, N)
     P = torch.zeros(N, N)
 
@@ -195,7 +194,7 @@ def flash_backward(Q, K, V, dO, l, m, softmax_scale):
 
             # Step 19 (skip 18). Should be Br long
             Di = (dOi * Oi).sum(1) # TODO check if we're summing right axis
-            # name_shape("Di",Di)
+
             # Step 20
             dSij = Pij * (dPij - Di[:, None])  # Br, Bc
             dS[q_start:q_end, kv_start:kv_end] = dSij  # optional writeback for debugging
