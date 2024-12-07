@@ -40,23 +40,33 @@ def naive_backward(Q, K, V, P, dO):
     return dQ, dK, dV
 
 def check_backward(Q, K, V, dO, softmax_scale):
-    def check_tensor(expected, actual):
-        assert torch.allclose(expected, actual, rtol = 1e-5, atol = 5e-3), "Tensor wrong"
+    def check_tensor(name, expected, actual):
+        try:
+            assert torch.allclose(expected, actual, rtol = 1e-5, atol = 5e-3), "Tensor wrong"
+        except:
+            print(f"Expected for {name}")
+            print(expected)
+            print("Actual")
+            print(actual)
 
     naive_S, naive_P, naive_O = naive_forward(Q, K, V, softmax_scale)
     naive_dQ, naive_dK, naive_dV = naive_backward(Q, K, V, naive_P, dO)
 
     flash_S, flash_O, l, m = flash_forward(Q, K, V, softmax_scale)
 
-    check_tensor(naive_S, flash_S)
-    check_tensor(naive_O, flash_O)
+    check_tensor("S", naive_S, flash_S)
+    # Didn't check "P" because naive_P and flash_P are different formats, kinda
+    check_tensor("O", naive_O, flash_O)
 
     flash_out = flash_backward(Q, K, V, dO, l, m, softmax_scale)
-    flash_dQ, flash_dK, flash_dV = flash_out
+    flash_dQ, flash_dK, flash_dV, flash_bS, flash_bP = flash_out
 
-    check_tensor(naive_dQ, flash_dQ)
-    check_tensor(naive_dK, flash_dK)
-    check_tensor(naive_dV, flash_dV)
+    check_tensor("bS", naive_S, flash_bS)  # Check the S is reconstructed correctly
+    check_tensor("bP", naive_P, flash_bP)  # Check tho P is reconstructed correctly
+
+    check_tensor("dQ", naive_dQ, flash_dQ)
+    check_tensor("dK", naive_dK, flash_dK)
+    check_tensor("dV", naive_dV, flash_dV)
     print("All pass")
 
 def flash_forward(Q, K, V, softmax_scale = 1.0):
@@ -74,6 +84,7 @@ def flash_forward(Q, K, V, softmax_scale = 1.0):
 
     O = torch.zeros(N, d)
     S = torch.zeros(N, N)
+    P = torch.zeros(N, N)
     l = torch.zeros(N)
     m = torch.ones(N) * float('-inf')
 
@@ -95,11 +106,12 @@ def flash_forward(Q, K, V, softmax_scale = 1.0):
 
             # Br x Bc
             Sij = Qi @ Kj.T * softmax_scale
-            S[q_start:q_end, kv_start:kv_end] = Sij
+            S[q_start:q_end, kv_start:kv_end] = Sij # Debugging
 
 
             m_t_ij = Sij.max(dim = 1)[0] # don't care about the indices, since this returns a tuple
             P_t_ij = torch.exp(Sij - m_t_ij[:, None])
+            P[q_start:q_end, kv_start:kv_end] = P_t_ij  # Debugging, didn't return
             l_t_ij = torch.sum(P_t_ij, dim = 1)
 
             mi_new = torch.max(m_t_ij, mi)
@@ -136,6 +148,7 @@ def flash_backward(Q, K, V, dO, l, m, softmax_scale):
 
     O = torch.zeros(N, d)
     S = torch.zeros(N, N)
+    P = torch.zeros(N, N)
 
     for j in range(Tc):
         kv_start = j * Bc
@@ -167,6 +180,7 @@ def flash_backward(Q, K, V, dO, l, m, softmax_scale):
 
             # Step 13 (skip 12)
             Pij = (1 / li)[:, None] * torch.exp(Sij - mi[:, None])
+            P[q_start:q_end, kv_start:kv_end] = Pij  # optional writeback for debugging
 
             # Step 16 (skip 13, 14)
             dVj[:] = dVj + Pij.T @ dOi
@@ -176,9 +190,10 @@ def flash_backward(Q, K, V, dO, l, m, softmax_scale):
 
             # Step 19 (skip 18). Should be Br long
             Di = (dOi * Oi).sum(1) # TODO check if we're summing right axis
-
+            # name_shape("Di",Di)
             # Step 20
             dSij = Pij * (dPij - Di[:, None])
+            # name_shape("dSij",dSij)
 
             # For these I'm writing to the outer one, but in CUDA you
             # would want to write to the local one, then only after the
@@ -190,6 +205,6 @@ def flash_backward(Q, K, V, dO, l, m, softmax_scale):
             # Step 22
             dKj[:] = dKj + dSij @ Qi * softmax_scale
 
-    return dQ, dK, dV
+    return dQ, dK, dV, S, P # for debugging
 
 check_backward(q, k, v, dO, sm_scale)
