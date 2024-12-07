@@ -119,6 +119,77 @@ def flash_forward(Q, K, V, softmax_scale = 1.0):
 
 
 def flash_backward(Q, K, V, dO, l, m, softmax_scale):
-    raise NotImplementedError
+    """
+    Q,K,V: (N,d)
+    """
+    N, d = q.size()
+
+    Bc = math.ceil(M / (4 * d))
+    Br = min(Bc, d)
+
+    Tc = math.ceil(N  / Bc)
+    Tr = math.ceil(N / Br)
+
+    dQ = torch.zeros(N, d)
+    dK = torch.zeros(N, d)
+    dV = torch.zeros(N, d)
+
+    O = torch.zeros(N, d)
+    S = torch.zeros(N, N)
+
+    for j in range(Tc):
+        kv_start = j * Bc
+        kv_end = (j + 1) * Bc
+        if kv_end > N: raise Exception("Invalid range")
+
+        Kj = K[kv_start:kv_end, :]
+        Vj = V[kv_start:kv_end, :]
+        dKj = dK[kv_start:kv_end, :]
+        dVj = dV[kv_start:kv_end, :]
+        for i in range(Tr):
+            q_start = i * Br
+            q_end = (i + 1) * Br
+            if q_end > N: raise Exception("Invalid range")
+
+            # Step 10
+            Qi = Q[q_start:q_end, :]
+            Oi = O[q_start:q_end, :]
+            dOi = dO[q_start:q_end, :]
+            dQi = dQ[q_start:q_end, :]
+            li = l[q_start:q_end]
+            mi = m[q_start:q_end]
+
+            def name_shape(n: str, t: torch.Tensor):
+                print(f"{n}: {t.shape}")
+            # Step 11
+            Sij = Qi @ Kj.T * softmax_scale
+            S[q_start:q_end, kv_start:kv_end] = Sij  # optional writeback for debugging
+
+            # Step 13 (skip 12)
+            Pij = (1 / li)[:, None] * torch.exp(Sij - mi[:, None])
+
+            # Step 16 (skip 13, 14)
+            dVj[:] = dVj + Pij.T @ dOi
+
+            # Step 17
+            dPij = dOi @ Vj.T
+
+            # Step 19 (skip 18). Should be Br long
+            Di = (dOi * Oi).sum(1) # TODO check if we're summing right axis
+
+            # Step 20
+            dSij = Pij * (dPij - Di[:, None])
+
+            # For these I'm writing to the outer one, but in CUDA you
+            # would want to write to the local one, then only after the
+            # i-loop write to the outer one.
+
+            # Step 21
+            dQi[:] = dQi + dSij @ Kj * softmax_scale
+
+            # Step 22
+            dKj[:] = dKj + dSij @ Qi * softmax_scale
+
+    return dQ, dK, dV
 
 check_backward(q, k, v, dO, sm_scale)
