@@ -175,8 +175,6 @@ def flash_backward(Q, K, V, O, dO, l, m, softmax_scale):
             li = l[q_start:q_end]
             mi = m[q_start:q_end]
 
-            def name_shape(n: str, t: torch.Tensor):
-                print(f"{n}: {t.shape}")
             # Step 11
             Sij = Qi @ Kj.T * softmax_scale
             S[q_start:q_end, kv_start:kv_end] = Sij  # optional writeback for debugging
@@ -192,8 +190,8 @@ def flash_backward(Q, K, V, O, dO, l, m, softmax_scale):
             dPij = dOi @ Vj.T
             dP[q_start:q_end, kv_start:kv_end] = dPij  # optional writeback for debugging
 
-            # Step 19 (skip 18). Should be Br long
-            Di = (dOi * Oi).sum(1) # TODO check if we're summing right axis
+            # Step 19 (skip 18)
+            Di = (dOi * Oi).sum(1)
 
             # Step 20
             dSij = Pij * (dPij - Di[:, None])  # Br, Bc
