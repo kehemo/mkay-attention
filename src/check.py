@@ -4,7 +4,7 @@ import math
 from einops import rearrange
 from ctypes import *
 import sys
-from triton_implementation import *
+
 
 
 def attention_torch_checkpoint(qkv):
