@@ -54,8 +54,8 @@ def flash_forward_model(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor):
     lm_shape = q.shape[:-1]
     # lm_shape = (q.shape[0], q.shape[1], q.shape[2], 1)
     O = torch.zeros_like(Q)
-    l = torch.zeros(lm_shape).unsqueeze(1)
-    m = torch.full(lm_shape, float('-inf')).unsqueeze(1)
+    l = torch.zeros(lm_shape)
+    m = torch.full(lm_shape, float('-inf'))
 
     print("Shapes of O, l, m")
     name_shape("O", O)
@@ -65,12 +65,12 @@ def flash_forward_model(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor):
     # Step 4 (Incomplete)
     Os = rearrange(O, '(g t) d -> g t d', g=T_r, t=B_r)
     # need statistic generation
-    ls = rearrange(l, "(g t) 1 -> g t 1", g=T_r, t=B_r)
-    ms = rearrange(m, "(g t) 1 -> g t 1", g=T_r, t=B_r)
+    ls = rearrange(l, "(g t) -> g t", g=T_r, t=B_r)
+    ms = rearrange(m, "(g t) -> g t", g=T_r, t=B_r)
     """
     Os  = (T_r, B_r, d)
-    ls  = (T_r, B_r, 1)  # Reduced across d already
-    ms  = (T_r, B_r, 1)
+    ls  = (T_r, B_r)  # Reduced across d already
+    ms  = (T_r, B_r)
     """
     print("(Step 4) Shapes of block-divided O, ls, ms")
     name_shape("Os", Os)
@@ -88,16 +88,16 @@ def flash_forward_model(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor):
             is_first = i == 0 and j == 0
             Q_i = Qs[i, :, :]
             O_i = Os[i, :, :]
-            l_i = ls[i, :, :]
-            m_i = ms[i, :, :]  # Should be updated every iteration
+            l_i = ls[i, :]
+            m_i = ms[i, :]  # Should be updated every iteration
 
             S_ij = softmax_scale * torch.einsum("td, sd -> ts", Q_i, K_j)  # Step 10
-            m_ij = S_ij.max(-1, keepdim=True).values  # bht1
+            m_ij = S_ij.max(-1).values  # bht1
             if is_first:
                 print("Inner loop shapes")
                 name_shape("S_ij", S_ij)
             P_ij = torch.exp(S_ij - m_ij)
-            l_ij = P_ij.sum(-1, keepdim=True)
+            l_ij = P_ij.sum(-1)
 
             if is_first:
                 name_shape("m_ij", m_ij)
