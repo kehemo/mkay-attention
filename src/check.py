@@ -4,6 +4,7 @@ import math
 from einops import rearrange
 from ctypes import *
 import sys
+import numpy as np
 
 
 def attention_torch_checkpoint(qkv):
@@ -96,4 +97,9 @@ def check(batch_size, seqlen, nheads, headdim, run_id):
 
 
 run_id = sys.argv[1]
-check(2, 32, 64, 32, run_id)
+
+sizes = np.genfromtxt(
+    os.path.join(script_dir, "test_sizes.csv"), delimiter=",", ndmin=2, dtype=np.int32
+)
+for row_index in range(sizes.shape[0]):
+    check(*sizes[row_index].tolist(), run_id)

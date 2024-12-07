@@ -1,5 +1,6 @@
 #!/bin/bash
 
+set -e
 # Output build directory path.
 CTR_BUILD_DIR=/build
 
@@ -24,5 +25,8 @@ echo "Building the project..."
 export TORCH_CUDA_ARCH_LIST='8.6'
 
 # Copy example.
+python3 generate_attention_data.py
 cp test*.bin ${CTR_BUILD_DIR}/
+cp test_sizes.csv ${CTR_BUILD_DIR}/
 nvcc -O3 kernel_raw.cu -o ${CTR_BUILD_DIR}/kernel
+echo "Finished build"

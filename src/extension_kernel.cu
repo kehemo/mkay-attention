@@ -21,7 +21,7 @@ std::vector<torch::Tensor> launch_attention_forward(torch::Tensor q, torch::Tens
 
     // malloc output tensors
     num *O;
-    size_t output_size = sizeof(num) * batch_size * nheads * seqlen * seqlen;
+    size_t output_size = sizeof(num) * batch_size * nheads * seqlen * head_dim;
     CUDA_CHECK(cudaMalloc(&O, output_size));
 
     num *S;
