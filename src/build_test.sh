@@ -28,5 +28,6 @@ export TORCH_CUDA_ARCH_LIST='8.6'
 python3 generate_attention_data.py
 cp test*.bin ${CTR_BUILD_DIR}/
 cp test_sizes.csv ${CTR_BUILD_DIR}/
+cp flash_attention_ref.py ${CTR_BUILD_DIR}/
 nvcc -O3 kernel_raw.cu -o ${CTR_BUILD_DIR}/kernel
 echo "Finished build"

@@ -281,23 +281,23 @@ __global__ void flash_attention(
     int T_c = ceil_div(params.seqlen, B_c);
     for (int j = 0; j < T_c; j++)
     {
+        int b_c_limit = min(B_c, params.seqlen - j * B_c);
         num kv_tile_offset = j * B_c * params.token_stride;
         const num *cur_k_tile = &cur_k[kv_tile_offset];
         const num *cur_v_tile = &cur_v[kv_tile_offset];
-        for (int block_idx = b_r_idx; block_idx < B_c * params.head_dim; block_idx += B_r)
+        for (int block_idx = b_r_idx; block_idx < b_c_limit * params.head_dim; block_idx += B_r)
         {
             int b_c_idx = block_idx / params.head_dim;
             int d_idx = block_idx % params.head_dim;
             int kv_idx = b_c_idx * params.token_stride + d_idx * params.dim_stride;
-            if (j * B_c + b_c_idx < params.seqlen)
-            {
-                shmem->K_tile[b_c_idx * params.head_dim + d_idx] = cur_k_tile[kv_idx];
-                shmem->V_tile[b_c_idx * params.head_dim + d_idx] = cur_v_tile[kv_idx];
-            }
+            shmem->K_tile[b_c_idx * params.head_dim + d_idx] = cur_k_tile[kv_idx];
+            shmem->V_tile[b_c_idx * params.head_dim + d_idx] = cur_v_tile[kv_idx];
         }
         __syncthreads();
         for (int i = 0; i < T_r; i++)
         {
+            if (i * B_r + b_r_idx >= params.seqlen)
+                continue;
             int qo_tile_offset = i * B_r * params.token_stride;
             const num *cur_q_tile = &cur_q[qo_tile_offset];
             num *cur_o_tile = &cur_o[qo_tile_offset];
@@ -307,13 +307,10 @@ __global__ void flash_attention(
             for (int d_idx = 0; d_idx < params.head_dim; d_idx++)
             {
                 int q_idx = b_r_idx * params.token_stride + d_idx * params.dim_stride;
-                if (i * B_r + b_r_idx < params.seqlen)
-                {
-                    shmem->Q_tile[b_r_idx * params.head_dim + d_idx] = cur_q_tile[q_idx];
-                }
+                shmem->Q_tile[b_r_idx * params.head_dim + d_idx] = cur_q_tile[q_idx];
             }
             num row_m = -__float2bfloat16(INFINITY);
-            for (int b_c_idx = 0; b_c_idx < B_c; b_c_idx++)
+            for (int b_c_idx = 0; b_c_idx < b_c_limit; b_c_idx++)
             {
                 num sum = 0;
                 for (int d_idx = 0; d_idx < params.head_dim; d_idx++)
@@ -325,7 +322,7 @@ __global__ void flash_attention(
                 row_m = __hmax(sum, row_m);
             }
             num row_l = 0;
-            for (int b_c_idx = 0; b_c_idx < B_c; b_c_idx++)
+            for (int b_c_idx = 0; b_c_idx < b_c_limit; b_c_idx++)
             {
                 row_l += hexp(shmem->S_tile[b_c_idx * B_r + b_r_idx] - row_m);
             }
@@ -337,20 +334,14 @@ __global__ void flash_attention(
             {
                 num *o_cell = &cur_o_tile[b_r_idx * params.token_stride + d_idx * params.dim_stride];
                 num pv_sum = 0;
-                for (int b_c_idx = 0; b_c_idx < B_c; b_c_idx++)
+                for (int b_c_idx = 0; b_c_idx < b_c_limit; b_c_idx++)
                 {
                     pv_sum += hexp(shmem->S_tile[b_c_idx * B_r + b_r_idx] - row_m) * shmem->V_tile[b_c_idx * params.head_dim + d_idx];
                 }
-                if (i * B_r + b_r_idx < params.seqlen)
-                {
-                    *o_cell = (old_l * hexp(old_m - new_m) * (*o_cell) + hexp(row_m - new_m) * pv_sum) / new_l;
-                }
+                *o_cell = (old_l * hexp(old_m - new_m) * (*o_cell) + hexp(row_m - new_m) * pv_sum) / new_l;
             }
-            if (i * B_r + b_r_idx < params.seqlen)
-            {
-                cur_l_tile[b_r_idx] = new_l;
-                cur_m_tile[b_r_idx] = new_m;
-            }
+            cur_l_tile[b_r_idx] = new_l;
+            cur_m_tile[b_r_idx] = new_m;
         }
         __syncthreads();
     }
