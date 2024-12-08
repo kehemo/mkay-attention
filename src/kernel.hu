@@ -30,6 +30,22 @@ void cuda_check(cudaError_t code, const char *file, int line)
         cuda_check((x), __FILE__, __LINE__); \
     } while (0)
 typedef __nv_bfloat16 num;
+typedef __nv_bfloat162 num_reg;
+
+__device__ __forceinline__ void cp_async4(void *smem_ptr, const void *glob_ptr)
+{
+    const int BYTES = 16;
+    uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], %2;" ::"r"(smem),
+        "l"(glob_ptr),
+        "n"(BYTES));
+}
+
+__device__ __forceinline__ void async_memcpy_waitall()
+{
+    asm volatile("cp.async.wait_all;\n" ::);
+}
 
 __global__ void add_one_kernel(float *data, int size)
 {
@@ -229,14 +245,16 @@ struct attention_params
     float softmax_scale;
 };
 
+constexpr int nums_in_vec = sizeof(float4) / sizeof(num);
 constexpr int shmem_max_size = 100000;
+constexpr int d_padding = nums_in_vec;
 
 template <int B_r, int B_c_split_size, int d_split_size, int splits>
 struct shmem_t
 {
-    num K_tile[B_c_split_size * d_split_size * splits * splits];
-    num V_tile[B_c_split_size * d_split_size * splits * splits];
-    num Q_tile[B_r * d_split_size * splits];
+    num K_tile[B_c_split_size * splits * (d_split_size * splits)];
+    num V_tile[B_c_split_size * splits * (d_split_size * splits)];
+    num Q_tile[B_r * (d_split_size * splits + d_padding)];
     num S_tile[B_r * B_c_split_size * splits];
 };
 
@@ -245,10 +263,10 @@ __host__ __device__ int ceil_div(int a, int b)
     return (a + b - 1) / b;
 }
 
-constexpr int max_threads = 256;
+constexpr int max_threads = 128;
 
 template <int B_r, int B_c_split_size, int d_split_size, int splits>
-__global__ void __launch_bounds__(128) flash_attention(
+__global__ void __launch_bounds__(max_threads) flash_attention(
     const num *__restrict__ q, const num *__restrict__ k, const num *__restrict__ v, num *__restrict__ o, num *__restrict__ L, attention_params params)
 {
     extern __shared__ shmem_t<B_r, B_c_split_size, d_split_size, splits> shmem[];
@@ -258,6 +276,7 @@ __global__ void __launch_bounds__(128) flash_attention(
     int b_r_idx = threadIdx.x;
     int split_idx = threadIdx.y;
     int thread_idx = b_r_idx + split_idx * B_r;
+    constexpr int threads = B_r * splits;
 
     int qkvo_offset = batch_idx * params.batch_stride + head_idx * params.head_stride;
     const num *cur_q = &q[qkvo_offset];
@@ -283,17 +302,32 @@ __global__ void __launch_bounds__(128) flash_attention(
     int d_split_end = min((split_idx + 1) * d_split_size, params.head_dim);
     int b_c_split_start = split_idx * B_c_split_size;
     int b_c_split_end = min((split_idx + 1) * B_c_split_size, params.seqlen);
+    constexpr int B_c = B_c_split_size * splits;
+    constexpr int max_d = d_split_size * splits;
+    constexpr int padded_d = max_d + d_padding;
 
-    for (int d_idx = d_split_start; d_idx < d_split_end; d_idx++)
+    if (params.dim_stride == 1 && max_d % nums_in_vec == 0 && params.head_dim == max_d && (i + 1) * B_r <= params.seqlen)
     {
-        int q_idx = b_r_idx * params.token_stride + d_idx * params.dim_stride;
-        if (b_r_inbounds)
+        for (int block_idx = thread_idx * nums_in_vec; block_idx < B_r * max_d; block_idx += nums_in_vec * threads)
         {
-            shmem->Q_tile[b_r_idx + d_idx * B_r] = tile_q[q_idx];
+            int b_r_idx = block_idx / max_d;
+            int d_idx = block_idx % max_d;
+            int q_idx = b_r_idx * params.token_stride + d_idx * params.dim_stride;
+            cp_async4(&shmem->Q_tile[b_r_idx * padded_d + d_idx], &tile_q[q_idx]);
+        }
+    }
+    else
+    {
+        for (int d_idx = d_split_start; d_idx < d_split_end; d_idx++)
+        {
+            int q_idx = b_r_idx * params.token_stride + d_idx * params.dim_stride;
+            if (b_r_inbounds)
+            {
+                shmem->Q_tile[b_r_idx * padded_d + d_idx] = tile_q[q_idx];
+            }
         }
     }
 
-    constexpr int B_c = B_c_split_size * splits;
     int T_c = ceil_div(params.seqlen, B_c);
     for (int j = 0; j < T_c; j++)
     {
@@ -301,21 +335,39 @@ __global__ void __launch_bounds__(128) flash_attention(
         int kv_tile_offset = j * B_c * params.token_stride;
         const num *tile_k = &cur_k[kv_tile_offset];
         const num *tile_v = &cur_v[kv_tile_offset];
-        for (int block_idx = thread_idx; block_idx < b_c_limit * params.head_dim; block_idx += B_r * splits)
+        if (params.dim_stride == 1 && max_d % nums_in_vec == 0 && b_c_limit == B_c && params.head_dim == max_d)
         {
-            int d_idx = block_idx / B_c;
-            int b_c_idx = block_idx % B_c;
-            int kv_idx = b_c_idx * params.token_stride + d_idx * params.dim_stride;
-            shmem->K_tile[b_c_idx + d_idx * B_c] = tile_k[kv_idx];
-            shmem->V_tile[b_c_idx + d_idx * B_c] = tile_v[kv_idx];
+            for (int block_idx = thread_idx * nums_in_vec; block_idx < B_c * max_d; block_idx += threads * nums_in_vec)
+            {
+                int b_c_idx = block_idx / max_d;
+                int d_idx = block_idx % max_d;
+                int kv_idx = b_c_idx * params.token_stride + d_idx * params.dim_stride;
+                cp_async4(&shmem->K_tile[b_c_idx * max_d + d_idx], &tile_k[kv_idx]);
+                cp_async4(&shmem->V_tile[b_c_idx * max_d + d_idx], &tile_v[kv_idx]);
+            }
         }
+        else
+        {
+            for (int block_idx = thread_idx; block_idx < B_c * params.head_dim; block_idx += threads)
+            {
+                int d_idx = block_idx / B_c;
+                int b_c_idx = block_idx % B_c;
+                int kv_idx = b_c_idx * params.token_stride + d_idx * params.dim_stride;
+                if (b_c_idx < b_c_limit)
+                {
+                    shmem->K_tile[b_c_idx * max_d + d_idx] = tile_k[kv_idx];
+                    shmem->V_tile[b_c_idx * max_d + d_idx] = tile_v[kv_idx];
+                }
+            }
+        }
+        async_memcpy_waitall();
         __syncthreads();
         for (int b_c_idx = b_c_split_start; b_c_idx < b_c_split_end; b_c_idx++)
         {
             float sum = 0.0f;
             for (int d_idx = 0; d_idx < params.head_dim; d_idx++)
             {
-                sum += __bfloat162float(shmem->Q_tile[b_r_idx + d_idx * B_r]) * __bfloat162float(shmem->K_tile[b_c_idx + d_idx * B_c]);
+                sum += __bfloat162float(shmem->Q_tile[b_r_idx * padded_d + d_idx]) * __bfloat162float(shmem->K_tile[b_c_idx * max_d + d_idx]);
             }
             sum *= params.softmax_scale;
             shmem->S_tile[b_r_idx + b_c_idx * B_r] = sum;
@@ -348,7 +400,7 @@ __global__ void __launch_bounds__(128) flash_attention(
             for (int d_split_idx = 0; d_split_idx < d_split_size; d_split_idx++)
             {
                 int d_idx = d_split_idx + d_split_start;
-                o_reg[d_split_idx] += __bfloat162float(shmem->S_tile[b_r_idx + b_c_idx * B_r]) * __bfloat162float(shmem->V_tile[b_c_idx + d_idx * B_c]);
+                o_reg[d_split_idx] += __bfloat162float(shmem->S_tile[b_r_idx + b_c_idx * B_r]) * __bfloat162float(shmem->V_tile[b_c_idx * max_d + d_idx]);
             }
         }
         m = new_m;
