@@ -40,6 +40,43 @@ __global__ void add_one_kernel(float *data, int size)
     }
 }
 
+// Only one thread should need to be timed, otherwise you might get
+// a bunch of unnecessary timings.
+const auto MAX_TIMESTAMPS = 32;
+struct DeviceTimer {
+    uint64_t timestamps[MAX_TIMESTAMPS];
+    char labels[MAX_TIMESTAMPS];
+    int current_timer = 0;
+    const bool on = true;
+
+    // Two special values: the first and last time this is called.
+    __device__ void clock(char label) {
+        if (on) {
+            assert(current_timer < MAX_TIMESTAMPS);
+            timestamps[current_timer] = clock64();
+            labels[current_timer] = label;
+            current_timer++;
+        }
+    }
+
+    __device__ void dump() {
+        if (on) {
+            const auto first = timestamps[0];
+            const auto last = timestamps[max(0, current_timer - 1)];
+            // These clock values are difficult to interpret on their own, so
+            // we take them as a proportion of the final counts.
+
+            const auto total = last - first;
+            printf("Total was %0ld\n", total);
+            for (auto i = 1; i < current_timer; i++) {
+                const auto portion = timestamps[i] - timestamps[i - 1];
+                const auto fraction = (double) portion / (double) total;
+                printf("[%0d] %c: %0lf\n", i, labels[i], fraction);
+            }
+        }
+    }
+};
+
 ////////////////////////////////////////////////////////////////////////////////
 ///  YOU DO NOT NEED TO MODIFY THE CODE ABOVE HERE (unless you want to).     ///
 ////////////////////////////////////////////////////////////////////////////////
@@ -261,10 +298,15 @@ void launch_fill(num *buffer, num val, int buffer_len)
 
 constexpr int max_threads = 256;
 
+#define CLOCK(c) if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) timer.clock(c)
+#define DUMP() if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) timer.dump()
+
 template <int B_r, int B_c, int max_d>
 __global__ void __launch_bounds__(128) flash_attention(
     const num *__restrict__ q, const num *__restrict__ k, const num *__restrict__ v, num *__restrict__ o, num *__restrict__ L, attention_params params)
 {
+    DeviceTimer timer;
+    CLOCK('0');
     extern __shared__ shmem_t shmem[];
     int batch_idx = blockIdx.x;
     int head_idx = blockIdx.y;
@@ -291,7 +333,8 @@ __global__ void __launch_bounds__(128) flash_attention(
     num m = __float2bfloat16(-INFINITY);
 
     bool b_r_inbounds = (b_r_idx + i * B_r < params.seqlen);
-
+    // Load Qi
+    CLOCK('A');
     for (int d_idx = 0; d_idx < params.head_dim; d_idx++)
     {
         int q_idx = b_r_idx * params.token_stride + d_idx * params.dim_stride;
@@ -300,6 +343,7 @@ __global__ void __launch_bounds__(128) flash_attention(
             shmem->Q_tile[b_r_idx + d_idx * B_r] = tile_q[q_idx];
         }
     }
+    CLOCK('B');
 
     int T_c = ceil_div(params.seqlen, B_c);
     for (int j = 0; j < T_c; j++)
@@ -308,6 +352,7 @@ __global__ void __launch_bounds__(128) flash_attention(
         int kv_tile_offset = j * B_c * params.token_stride;
         const num *cur_k_tile = &cur_k[kv_tile_offset];
         const num *cur_v_tile = &cur_v[kv_tile_offset];
+        // Load Kj, Vj
         for (int block_idx = b_r_idx; block_idx < B_c * params.head_dim; block_idx += B_r)
         {
             int d_idx = block_idx / B_c;
@@ -321,6 +366,7 @@ __global__ void __launch_bounds__(128) flash_attention(
         num s[B_c];
         for (int b_c_idx = 0; b_c_idx < B_c; b_c_idx++)
         {
+            // Compute S_ij
             num sum = 0;
             for (int d_idx = 0; d_idx < params.head_dim; d_idx++)
             {
@@ -328,11 +374,14 @@ __global__ void __launch_bounds__(128) flash_attention(
             }
             sum *= __float2bfloat16(params.softmax_scale);
             s[b_c_idx] = sum;
+            // Compute m_ij
             if (b_c_idx < b_c_limit)
             {
                 new_m = __hmax(new_m, sum);
             }
         }
+        if (j == 1) CLOCK('C');
+        // l_ij calculation
         num new_l = hexp(m - new_m) * l;
         for (int b_c_idx = 0; b_c_idx < B_c; b_c_idx++)
         {
@@ -341,20 +390,26 @@ __global__ void __launch_bounds__(128) flash_attention(
                 new_l += hexp(s[b_c_idx] - new_m);
             }
         }
+        if (j == 1) CLOCK('D');
         for (int d_idx = 0; d_idx < max_d; d_idx++)
         {
+            // Step 10: diag() factor
             o_reg[d_idx] /= __hmax(CUDART_MIN_DENORM_BF16, hexp(m - new_m));
             for (int b_c_idx = 0; b_c_idx < B_c; b_c_idx++)
             {
                 if (b_c_idx < b_c_limit && d_idx < params.head_dim)
                 {
+                    // Pij inline * Vj
                     o_reg[d_idx] += hexp(s[b_c_idx] - new_m) * shmem->V_tile[b_c_idx + d_idx * B_c];
                 }
             }
         }
+        if (j == 1) CLOCK('E');
+        CLOCK('0');
         m = new_m;
         l = new_l;
     }
+    CLOCK('F');
     for (int d_idx = 0; d_idx < max_d; d_idx++)
     {
         int o_idx = b_r_idx * params.token_stride + d_idx * params.dim_stride;
@@ -367,6 +422,8 @@ __global__ void __launch_bounds__(128) flash_attention(
     {
         tile_L[b_r_idx] = m + hlog(l);
     }
+    CLOCK('Z');
+    DUMP();
 }
 
 void launch_flash_attention(
