@@ -230,13 +230,14 @@ struct attention_params
 };
 
 constexpr int shmem_max_size = 100000;
-constexpr int tile_size = shmem_max_size / sizeof(num) / 3;
 
+template <int B_r, int B_c_split_size, int d_split_size, int splits>
 struct shmem_t
 {
-    num K_tile[tile_size];
-    num V_tile[tile_size];
-    num Q_tile[tile_size];
+    num K_tile[B_c_split_size * d_split_size * splits * splits];
+    num V_tile[B_c_split_size * d_split_size * splits * splits];
+    num Q_tile[B_r * d_split_size * splits];
+    num S_tile[B_r * B_c_split_size * splits];
 };
 
 __host__ __device__ int ceil_div(int a, int b)
@@ -246,15 +247,17 @@ __host__ __device__ int ceil_div(int a, int b)
 
 constexpr int max_threads = 256;
 
-template <int B_r, int B_c, int max_d>
+template <int B_r, int B_c_split_size, int d_split_size, int splits>
 __global__ void __launch_bounds__(128) flash_attention(
     const num *__restrict__ q, const num *__restrict__ k, const num *__restrict__ v, num *__restrict__ o, num *__restrict__ L, attention_params params)
 {
-    extern __shared__ shmem_t shmem[];
+    extern __shared__ shmem_t<B_r, B_c_split_size, d_split_size, splits> shmem[];
     int batch_idx = blockIdx.x;
     int head_idx = blockIdx.y;
     int i = blockIdx.z;
     int b_r_idx = threadIdx.x;
+    int split_idx = threadIdx.y;
+    int thread_idx = b_r_idx + split_idx * B_r;
 
     int qkvo_offset = batch_idx * params.batch_stride + head_idx * params.head_stride;
     const num *cur_q = &q[qkvo_offset];
@@ -271,13 +274,17 @@ __global__ void __launch_bounds__(128) flash_attention(
     int L_tile_offset = i * B_r;
     num *tile_L = &cur_L[L_tile_offset];
 
-    float o_reg[max_d] = {0};
+    float o_reg[d_split_size] = {0};
     float l = 0;
-    float m = (-INFINITY);
+    num m = __float2bfloat16(-INFINITY);
 
     bool b_r_inbounds = (b_r_idx + i * B_r < params.seqlen);
+    int d_split_start = split_idx * d_split_size;
+    int d_split_end = min((split_idx + 1) * d_split_size, params.head_dim);
+    int b_c_split_start = split_idx * B_c_split_size;
+    int b_c_split_end = min((split_idx + 1) * B_c_split_size, params.seqlen);
 
-    for (int d_idx = 0; d_idx < params.head_dim; d_idx++)
+    for (int d_idx = d_split_start; d_idx < d_split_end; d_idx++)
     {
         int q_idx = b_r_idx * params.token_stride + d_idx * params.dim_stride;
         if (b_r_inbounds)
@@ -286,6 +293,7 @@ __global__ void __launch_bounds__(128) flash_attention(
         }
     }
 
+    constexpr int B_c = B_c_split_size * splits;
     int T_c = ceil_div(params.seqlen, B_c);
     for (int j = 0; j < T_c; j++)
     {
@@ -293,7 +301,7 @@ __global__ void __launch_bounds__(128) flash_attention(
         int kv_tile_offset = j * B_c * params.token_stride;
         const num *tile_k = &cur_k[kv_tile_offset];
         const num *tile_v = &cur_v[kv_tile_offset];
-        for (int block_idx = b_r_idx; block_idx < B_c * params.head_dim; block_idx += B_r)
+        for (int block_idx = thread_idx; block_idx < b_c_limit * params.head_dim; block_idx += B_r * splits)
         {
             int d_idx = block_idx / B_c;
             int b_c_idx = block_idx % B_c;
@@ -302,9 +310,7 @@ __global__ void __launch_bounds__(128) flash_attention(
             shmem->V_tile[b_c_idx + d_idx * B_c] = tile_v[kv_idx];
         }
         __syncthreads();
-        float new_m = m;
-        num s[B_c];
-        for (int b_c_idx = 0; b_c_idx < B_c; b_c_idx++)
+        for (int b_c_idx = b_c_split_start; b_c_idx < b_c_split_end; b_c_idx++)
         {
             float sum = 0.0f;
             for (int d_idx = 0; d_idx < params.head_dim; d_idx++)
@@ -312,67 +318,73 @@ __global__ void __launch_bounds__(128) flash_attention(
                 sum += __bfloat162float(shmem->Q_tile[b_r_idx + d_idx * B_r]) * __bfloat162float(shmem->K_tile[b_c_idx + d_idx * B_c]);
             }
             sum *= params.softmax_scale;
-            s[b_c_idx] = sum;
-            if (b_c_idx < b_c_limit)
-            {
-                new_m = max(new_m, sum);
-            }
+            shmem->S_tile[b_r_idx + b_c_idx * B_r] = sum;
         }
-        float exp_diff = expf(m - new_m);
+        __syncthreads();
+        num new_m = m;
+        for (int b_c_idx = 0; b_c_idx < b_c_limit; b_c_idx++)
+        {
+            new_m = __hmax(new_m, shmem->S_tile[b_r_idx + b_c_idx * B_r]);
+        }
+        __syncthreads();
+        float exp_diff = expf(__bfloat162float(m - new_m));
+        for (int b_c_idx = b_c_split_start; b_c_idx < b_c_split_end; b_c_idx++)
+        {
+            num p = hexp(shmem->S_tile[b_r_idx + b_c_idx * B_r] - __float2bfloat16(new_m));
+            shmem->S_tile[b_r_idx + b_c_idx * B_r] = p;
+        }
+        __syncthreads();
         float new_l = exp_diff * l;
-        for (int b_c_idx = 0; b_c_idx < B_c; b_c_idx++)
+        for (int b_c_idx = 0; b_c_idx < b_c_limit; b_c_idx++)
         {
-            if (b_c_idx < b_c_limit)
-            {
-                num p = hexp(s[b_c_idx] - __float2bfloat16(new_m));
-                new_l += __bfloat162float(p);
-                s[b_c_idx] = p;
-            }
+            new_l += __bfloat162float(shmem->S_tile[b_r_idx + b_c_idx * B_r]);
         }
-        for (int d_idx = 0; d_idx < max_d; d_idx++)
+        for (int d_split_idx = 0; d_split_idx < d_split_size; d_split_idx++)
         {
-            o_reg[d_idx] *= exp_diff;
-            for (int b_c_idx = 0; b_c_idx < B_c; b_c_idx++)
+            o_reg[d_split_idx] *= exp_diff;
+        }
+        for (int b_c_idx = 0; b_c_idx < b_c_limit; b_c_idx++)
+        {
+            for (int d_split_idx = 0; d_split_idx < d_split_size; d_split_idx++)
             {
-                if (b_c_idx < b_c_limit && d_idx < params.head_dim)
-                {
-                    o_reg[d_idx] = o_reg[d_idx] + __bfloat162float(s[b_c_idx]) * __bfloat162float(shmem->V_tile[b_c_idx + d_idx * B_c]);
-                }
+                int d_idx = d_split_idx + d_split_start;
+                o_reg[d_split_idx] += __bfloat162float(shmem->S_tile[b_r_idx + b_c_idx * B_r]) * __bfloat162float(shmem->V_tile[b_c_idx + d_idx * B_c]);
             }
         }
         m = new_m;
         l = new_l;
     }
-    for (int d_idx = 0; d_idx < max_d; d_idx++)
+    for (int d_split_idx = 0; d_split_idx < d_split_size; d_split_idx++)
     {
+        int d_idx = d_split_start + d_split_idx;
         int o_idx = b_r_idx * params.token_stride + d_idx * params.dim_stride;
         if (d_idx < params.head_dim && b_r_inbounds)
         {
-            tile_o[o_idx] = __float2bfloat16(o_reg[d_idx] / l);
+            tile_o[o_idx] = __float2bfloat16(o_reg[d_split_idx] / l);
         }
     }
     if (b_r_inbounds)
     {
-        tile_L[b_r_idx] = __float2bfloat16(m + log(l));
+        tile_L[b_r_idx] = m + __float2bfloat16(log(l));
     }
 }
 
 void launch_flash_attention(
     const num *q, const num *k, const num *v, num *o, num *L, attention_params params)
 {
-    int max_B_r = tile_size / params.head_dim;
-    constexpr int B_r = 128;
-    assert(max_B_r >= B_r);
-    int max_B_c = min(B_r, params.head_dim);
-    constexpr int B_c = 128;
-    assert(max_B_c >= B_c);
+    constexpr int splits = 2;
+    constexpr int B_r = 64;
+    constexpr int B_c_split_size = 64;
     int T_r = ceil_div(params.seqlen, B_r);
     dim3 blocks = dim3(params.batch_size, params.nheads, T_r);
-    constexpr int max_d = 128;
-    assert(max_d >= params.head_dim);
+    dim3 threads = dim3(B_r, splits);
+    constexpr int d_split_size = 64;
+    assert(d_split_size * splits >= params.head_dim);
+    typedef shmem_t<B_r, B_c_split_size, d_split_size, splits> shmem_t_instance;
     CUDA_CHECK(cudaFuncSetAttribute(
-        flash_attention<B_r, B_c, max_d>,
+        flash_attention<B_r, B_c_split_size, d_split_size, splits>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
-        sizeof(shmem_t)));
-    flash_attention<B_r, B_c, max_d><<<blocks, B_r, sizeof(shmem_t)>>>(q, k, v, o, L, params);
+        sizeof(shmem_t_instance)));
+    flash_attention<B_r, B_c_split_size, d_split_size, splits>
+        <<<blocks, threads, sizeof(shmem_t_instance)>>>(q, k, v, o, L, params);
 }
