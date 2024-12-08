@@ -89,21 +89,7 @@ def attention_triton(
     Oi = tl.zeros((Br, hdim), dtype=tl.float32)
     Tc = tl.cdiv(seqlen, Bc)
 
-    # handle j = 0 separately
-    Kj = tl.load(k_block_ptr)
-    Vj = tl.load(v_block_ptr)
-
-    Sij = tl.dot(Qi, tl.trans(Kj)) * softmax_score
-    mi = tl.max(Sij, axis = 1)
-    P_t_ij = tl.exp(Sij - mi[:, None])
-    li = tl.sum(P_t_ij, axis = 1)
-    Oi = tl.dot(P_t_ij, Vj)
-    # advance the block pointers
-    k_block_ptr = tl.advance(k_block_ptr, (Bc, 0))
-    v_block_ptr = tl.advance(v_block_ptr, (Bc, 0))
-
-
-    for j in range(1, Tc):
+    for j in range(Tc):
         Kj = tl.load(k_block_ptr)
         Vj = tl.load(v_block_ptr)
         
@@ -112,9 +98,7 @@ def attention_triton(
         mi_new = tl.maximum(mi, tl.max(Sij, axis = 1))
         P_t_ij = tl.exp(Sij - mi_new[:, None])
         li_new = tl.exp(mi - mi_new) * li + tl.sum(P_t_ij, axis = 1)
-        Oi = (1 / tl.exp(mi - mi_new))[:, None] * Oi + tl.dot(P_t_ij, Vj) 
-
-
+        Oi = tl.exp(mi - mi_new)[:, None] * Oi + tl.dot(P_t_ij, Vj) 
 
         # advance the block pointers
         k_block_ptr = tl.advance(k_block_ptr, (Bc, 0))
