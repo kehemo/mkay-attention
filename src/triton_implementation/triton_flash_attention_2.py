@@ -21,8 +21,8 @@ def attention_triton(
     q, k, v, 
     output, softmax_score,
     seqlen, nheads, hdim: tl.constexpr,
-    l, m, 
-    lm_batch_stride, lm_heads_stride,
+    L, 
+    L_batch_stride, L_heads_stride,
     batch_stride, seqlen_stride, nheads_stride, 
     Br : tl.constexpr, Bc : tl.constexpr):
 
@@ -75,57 +75,57 @@ def attention_triton(
         order = (1, 0)
     )
 
-    # set up l_i, m_i
-    l_ptr = l + batch_id * lm_batch_stride + head_id * lm_heads_stride
-    m_ptr = m + batch_id * lm_batch_stride + head_id * lm_heads_stride
-    lm_offsets = Tr_i * Br + tl.arange(0, Br)
-    lm_mask = lm_offsets < seqlen
-    l_ptrs = l_ptr + lm_offsets
-    m_ptrs = m_ptr + lm_offsets
+    # set up L
+    L_ptr = L + batch_id * L_batch_stride + head_id * L_heads_stride
+    L_offsets = Tr_i * Br + tl.arange(0, Br)
+    L_mask = L_offsets < seqlen
+    L_ptrs = L_ptr + L_offsets
+    
+    # set up li, mi
+    li = tl.zeros((Br,), dtype=tl.float32)
+    mi = tl.zeros((Br,), dtype=tl.float32) - float("inf")
 
-
-
-    """
-    Stage 2: compute O_i
-    """
     Qi = tl.load(q_block_ptr)
-    Oi = tl.zeros((Br, hdim), dtype=tl.float32) # TODO: fix this later
-    li = tl.load(l_ptrs, mask = lm_mask, other = 0.0)
-    mi = tl.load(m_ptrs, mask = lm_mask, other = float("-inf"))
-
-
+    Oi = tl.zeros((Br, hdim), dtype=tl.float32)
     Tc = tl.cdiv(seqlen, Bc)
-    for j in range(0, Tc):
+
+    # handle j = 0 separately
+    Kj = tl.load(k_block_ptr)
+    Vj = tl.load(v_block_ptr)
+
+    Sij = tl.dot(Qi, tl.trans(Kj)) * softmax_score
+    mi = tl.max(Sij, axis = 1)
+    P_t_ij = tl.exp(Sij - mi[:, None])
+    li = tl.sum(P_t_ij, axis = 1)
+    Oi = tl.dot(P_t_ij, Vj)
+    # advance the block pointers
+    k_block_ptr = tl.advance(k_block_ptr, (Bc, 0))
+    v_block_ptr = tl.advance(v_block_ptr, (Bc, 0))
+
+
+    for j in range(1, Tc):
         Kj = tl.load(k_block_ptr)
         Vj = tl.load(v_block_ptr)
         
         # Sij: (Br, Bc)
         Sij = tl.dot(Qi, tl.trans(Kj)) * softmax_score
-        m_t_ij = tl.max(Sij, axis = 1)
-
-        P_t_ij = tl.exp(Sij - m_t_ij[:, None])
-        l_t_ij = tl.sum(P_t_ij, axis = 1)
-
-        mi_new = tl.maximum(mi, m_t_ij)
-        li_new = tl.exp(mi - mi_new) * li + tl.exp(m_t_ij - mi_new) * l_t_ij # TODO: issue with triton exponent, ask Yaro
-
-        # TODO: this materializes Oi_new which also takes up sram space.
-        Oi_new = (li * tl.exp(mi - mi_new))[:, None] * Oi
-        Oi_new += (tl.exp(m_t_ij - mi_new))[:, None] * tl.dot(P_t_ij, Vj)
-        Oi_new = Oi_new * (1 / li_new)[:, None]
-
-        Oi = Oi_new
-        li = li_new
-        mi = mi_new
+        mi_new = tl.maximum(mi, tl.max(Sij, axis = 1))
+        P_t_ij = tl.exp(Sij - mi_new[:, None])
+        li_new = tl.exp(mi - mi_new) * li + tl.sum(P_t_ij, axis = 1)
+        Oi = (1 / tl.exp(mi - mi_new))[:, None] * Oi + tl.dot(P_t_ij, Vj) 
 
 
 
         # advance the block pointers
         k_block_ptr = tl.advance(k_block_ptr, (Bc, 0))
         v_block_ptr = tl.advance(v_block_ptr, (Bc, 0))
+        mi = mi_new
+        li = li_new
         
-
+    Oi = (1 / li[:, None]) * Oi
+    Li = mi + tl.log(li)
     tl.store(out_block_ptr, Oi)
+    tl.store(L_ptrs, Li, mask = L_mask)
 
 def attention_triton_launch(qkv):
     qkv = qkv.to(torch.float32)
@@ -134,11 +134,9 @@ def attention_triton_launch(qkv):
     output = torch.zeros_like(q_cont, dtype=qkv.dtype)
 
     B, N, H, D = q_cont.shape
-    l = torch.zeros((B, H, N), dtype=qkv.dtype, device=qkv.device)
-    m = float("-inf") * torch.ones((B, H, N), dtype=qkv.dtype, device=qkv.device)
+    L = torch.zeros((B, H, N), dtype=qkv.dtype, device=qkv.device)
 
-    # l and m will have the same strides
-    lm_batch_stride, lm_heads_stride, _ = m.stride()
+    L_batch_stride, L_heads_stride, _ = L.stride()
     batch_stride, seqlen_stride, nheads_stride, _ = q_cont.stride()
 
 
@@ -151,8 +149,8 @@ def attention_triton_launch(qkv):
         q_cont, k_cont, v_cont, 
         output, 1 / math.sqrt(D),
         N, H, D,
-        l, m,
-        lm_batch_stride, lm_heads_stride,
+        L,
+        L_batch_stride, L_heads_stride,
         batch_stride, seqlen_stride, nheads_stride,
     )
 
