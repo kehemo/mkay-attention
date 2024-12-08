@@ -96,12 +96,9 @@ launch_raw_result bench_flash_attention_raw(num *q, num *k, num *v,
     params.softmax_scale = rsqrtf(head_dim);
 
     // malloc output tensors
-    num *l;
-    size_t lm_size = sizeof(num) * params.batch_size * params.nheads * params.seqlen;
-    CUDA_CHECK(cudaMalloc(&l, lm_size));
-
-    num *m;
-    CUDA_CHECK(cudaMalloc(&m, lm_size));
+    num *L;
+    size_t L_size = sizeof(num) * params.batch_size * params.nheads * params.seqlen;
+    CUDA_CHECK(cudaMalloc(&L, L_size));
 
     num *o;
     size_t output_size = sizeof(num) * batch_size * nheads * seqlen * head_dim;
@@ -114,7 +111,7 @@ launch_raw_result bench_flash_attention_raw(num *q, num *k, num *v,
     {
         CUDA_CHECK(cudaDeviceSynchronize());
         auto start = std::chrono::high_resolution_clock::now();
-        launch_flash_attention(q, k, v, o, l, m, params);
+        launch_flash_attention(q, k, v, o, L, params);
         CUDA_CHECK(cudaDeviceSynchronize());
         auto end = std::chrono::high_resolution_clock::now();
         double this_ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -124,42 +121,10 @@ launch_raw_result bench_flash_attention_raw(num *q, num *k, num *v,
     std::cout << "Time: " << best_time_ms << " ms" << std::endl;
     std::cout << "Throughput: " << (ops / best_time_ms / 1e9) << " TFLOP/s" << std::endl;
 
-    CUDA_CHECK(cudaFree(l));
-    CUDA_CHECK(cudaFree(m));
+    CUDA_CHECK(cudaFree(L));
     return {o, output_size};
 }
 
-launch_raw_result launch_flash_attention_raw(num *q, num *k, num *v,
-                                             int batch_size, int seqlen, int nheads, int head_dim)
-{
-    attention_params params = {0};
-    params.batch_stride = seqlen * nheads * head_dim;
-    params.token_stride = nheads * head_dim;
-    params.head_stride = head_dim;
-    params.dim_stride = 1;
-    params.batch_size = batch_size;
-    params.seqlen = seqlen;
-    params.nheads = nheads;
-    params.head_dim = head_dim;
-    params.softmax_scale = rsqrtf(head_dim);
-
-    // malloc output tensors
-    num *l;
-    size_t lm_size = sizeof(num) * params.batch_size * params.nheads * params.seqlen;
-    CUDA_CHECK(cudaMalloc(&l, lm_size));
-
-    num *m;
-    CUDA_CHECK(cudaMalloc(&m, lm_size));
-
-    num *o;
-    size_t output_size = sizeof(num) * batch_size * nheads * seqlen * head_dim;
-    CUDA_CHECK(cudaMalloc(&o, output_size));
-    launch_flash_attention(q, k, v, o, l, m, params);
-
-    CUDA_CHECK(cudaFree(l));
-    CUDA_CHECK(cudaFree(m));
-    return {o, output_size};
-}
 /// <--- /your code here --->
 
 ////////////////////////////////////////////////////////////////////////////////

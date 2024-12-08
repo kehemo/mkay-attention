@@ -91,6 +91,7 @@ def check(batch_size, seqlen, nheads, headdim, run_id):
     torch_output = attention_torch_checkpoint(qkv)
     cuda_output = from_file(o_fname, dims=(batch_size, seqlen, nheads, headdim))
     get_tensor_difference(torch_output, cuda_output)
+    print(cuda_output / torch_output)
 
     rel_rmse = compute_relative_rmse(torch_output, cuda_output)
     print(f"\n\n>>> Relative RMSE: {rel_rmse}")
