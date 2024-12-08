@@ -21,7 +21,7 @@ def flash_forward(Q, K, V, softmax_scale = 1.0):
     """
     Q,K,V: (N,d)
     """
-    N, d = q.size()
+    N, d = Q.size()
 
 
     Bc = math.ceil(M / (4 * d))
