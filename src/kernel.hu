@@ -244,21 +244,6 @@ __host__ __device__ int ceil_div(int a, int b)
     return (a + b - 1) / b;
 }
 
-__global__ void fill(num *buffer, num val, int buffer_len)
-{
-    int thread_x = threadIdx.x + blockIdx.x * blockDim.x;
-    if (thread_x < buffer_len)
-    {
-        buffer[thread_x] = val;
-    }
-}
-
-void launch_fill(num *buffer, num val, int buffer_len)
-{
-    constexpr int threads = 128;
-    fill<<<ceil_div(buffer_len, threads), threads>>>(buffer, val, buffer_len);
-}
-
 constexpr int max_threads = 256;
 
 template <int B_r, int B_c, int max_d>
@@ -286,9 +271,9 @@ __global__ void __launch_bounds__(128) flash_attention(
     int L_tile_offset = i * B_r;
     num *tile_L = &cur_L[L_tile_offset];
 
-    num o_reg[max_d] = {0};
-    num l = 0;
-    num m = __float2bfloat16(-INFINITY);
+    float o_reg[max_d] = {0};
+    float l = 0;
+    float m = (-INFINITY);
 
     bool b_r_inbounds = (b_r_idx + i * B_r < params.seqlen);
 
@@ -306,49 +291,52 @@ __global__ void __launch_bounds__(128) flash_attention(
     {
         int b_c_limit = min(B_c, params.seqlen - j * B_c);
         int kv_tile_offset = j * B_c * params.token_stride;
-        const num *cur_k_tile = &cur_k[kv_tile_offset];
-        const num *cur_v_tile = &cur_v[kv_tile_offset];
+        const num *tile_k = &cur_k[kv_tile_offset];
+        const num *tile_v = &cur_v[kv_tile_offset];
         for (int block_idx = b_r_idx; block_idx < B_c * params.head_dim; block_idx += B_r)
         {
             int d_idx = block_idx / B_c;
             int b_c_idx = block_idx % B_c;
             int kv_idx = b_c_idx * params.token_stride + d_idx * params.dim_stride;
-            shmem->K_tile[block_idx] = cur_k_tile[kv_idx];
-            shmem->V_tile[block_idx] = cur_v_tile[kv_idx];
+            shmem->K_tile[b_c_idx + d_idx * B_c] = tile_k[kv_idx];
+            shmem->V_tile[b_c_idx + d_idx * B_c] = tile_v[kv_idx];
         }
         __syncthreads();
-        num new_m = m;
+        float new_m = m;
         num s[B_c];
         for (int b_c_idx = 0; b_c_idx < B_c; b_c_idx++)
         {
-            num sum = 0;
+            float sum = 0.0f;
             for (int d_idx = 0; d_idx < params.head_dim; d_idx++)
             {
-                sum += shmem->Q_tile[b_r_idx + d_idx * B_r] * shmem->K_tile[b_c_idx + d_idx * B_c];
+                sum += __bfloat162float(shmem->Q_tile[b_r_idx + d_idx * B_r]) * __bfloat162float(shmem->K_tile[b_c_idx + d_idx * B_c]);
             }
-            sum *= __float2bfloat16(params.softmax_scale);
+            sum *= params.softmax_scale;
             s[b_c_idx] = sum;
             if (b_c_idx < b_c_limit)
             {
-                new_m = __hmax(new_m, sum);
+                new_m = max(new_m, sum);
             }
         }
-        num new_l = hexp(m - new_m) * l;
+        float exp_diff = expf(m - new_m);
+        float new_l = exp_diff * l;
         for (int b_c_idx = 0; b_c_idx < B_c; b_c_idx++)
         {
             if (b_c_idx < b_c_limit)
             {
-                new_l += hexp(s[b_c_idx] - new_m);
+                num p = hexp(s[b_c_idx] - __float2bfloat16(new_m));
+                new_l += __bfloat162float(p);
+                s[b_c_idx] = p;
             }
         }
         for (int d_idx = 0; d_idx < max_d; d_idx++)
         {
-            o_reg[d_idx] /= __hmax(CUDART_MIN_DENORM_BF16, hexp(m - new_m));
+            o_reg[d_idx] *= exp_diff;
             for (int b_c_idx = 0; b_c_idx < B_c; b_c_idx++)
             {
                 if (b_c_idx < b_c_limit && d_idx < params.head_dim)
                 {
-                    o_reg[d_idx] += hexp(s[b_c_idx] - new_m) * shmem->V_tile[b_c_idx + d_idx * B_c];
+                    o_reg[d_idx] = o_reg[d_idx] + __bfloat162float(s[b_c_idx]) * __bfloat162float(shmem->V_tile[b_c_idx + d_idx * B_c]);
                 }
             }
         }
@@ -360,12 +348,12 @@ __global__ void __launch_bounds__(128) flash_attention(
         int o_idx = b_r_idx * params.token_stride + d_idx * params.dim_stride;
         if (d_idx < params.head_dim && b_r_inbounds)
         {
-            tile_o[o_idx] = o_reg[d_idx] / l;
+            tile_o[o_idx] = __float2bfloat16(o_reg[d_idx] / l);
         }
     }
     if (b_r_inbounds)
     {
-        tile_L[b_r_idx] = m + hlog(l);
+        tile_L[b_r_idx] = __float2bfloat16(m + log(l));
     }
 }
 
