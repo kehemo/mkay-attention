@@ -71,7 +71,7 @@ struct DeviceTimer {
             for (auto i = 1; i < current_timer; i++) {
                 const auto portion = timestamps[i] - timestamps[i - 1];
                 const auto fraction = (double) portion / (double) total;
-                printf("[%0d] %c: %0lf\n", i, labels[i], fraction);
+                printf("[%0d] %c: %0.2lf%\n", i, labels[i], 100 * fraction);
             }
         }
     }
