@@ -354,9 +354,9 @@ __global__ void __launch_bounds__(max_threads) flash_attention(
         }
     }
 
-    for (int block_idx = thread_idx * nums_in_vec; block_idx < B_r * max_d; block_idx += nums_in_vec * threads)
+    for (int block_idx = thread_idx * 4; block_idx < B_r * max_d; block_idx += 4 * threads)
     {
-        *reinterpret_cast<float2 *>(&shmem->O_tile[block_idx]) = {0};
+        *reinterpret_cast<float4 *>(&shmem->O_tile[block_idx]) = {0};
     }
 
     int tc_A_m_offset = warp_thread_idx / 4;
@@ -467,7 +467,7 @@ __global__ void __launch_bounds__(max_threads) flash_attention(
                     int b_c_idx = b_c_base + tc_CD_n_offset + tc_CD_n_stride[tc_CD_idx];
                     if (b_r_idx < b_r_limit && b_c_idx < b_c_limit)
                     {
-                        *reinterpret_cast<num_reg *>(&shmem->S_tile[b_r_idx * padded_B_c + b_c_idx]) = (num_reg){__float2bfloat16(__uint_as_float(tc_S[tc_CD_idx]) * params.softmax_scale), __float2bfloat16(__uint_as_float(tc_S[tc_CD_idx + 1]) * params.softmax_scale)};
+                        *reinterpret_cast<num_reg *>(&shmem->S_tile[b_r_idx * padded_B_c + b_c_idx]) = __floats2bfloat162_rn(__uint_as_float(tc_S[tc_CD_idx]) * params.softmax_scale, __float2bfloat16(__uint_as_float(tc_S[tc_CD_idx + 1]) * params.softmax_scale));
                     }
                 }
             }
@@ -494,24 +494,25 @@ __global__ void __launch_bounds__(max_threads) flash_attention(
         }
         __syncthreads();
         num_reg S_tile_row[B_c / nums_in_reg];
-        num_reg new_m_reg = {m, m};
+        num_reg acc_m_reg = {m, m};
         for (int b_c_idx = 0; b_c_idx < B_c; b_c_idx += nums_in_vec)
         {
             num_vec s_vec = *reinterpret_cast<num_vec *>(&shmem->S_tile[b_r_idx * padded_B_c + b_c_idx]);
             for (int vec_idx = 0; vec_idx < nums_in_vec; vec_idx += nums_in_reg)
             {
                 num_reg s_val_reg = {s_vec.inner[vec_idx], s_vec.inner[vec_idx + 1]};
-                new_m_reg = __hmax2(new_m_reg, s_val_reg);
+                acc_m_reg = __hmax2(acc_m_reg, s_val_reg);
                 S_tile_row[(b_c_idx + vec_idx) / nums_in_reg] = s_val_reg;
             }
         }
-        num new_m = __hmax(new_m_reg.x, new_m_reg.y);
+        num new_m = __hmax(acc_m_reg.x, acc_m_reg.y);
+        num_reg new_m_reg = make_bfloat162(new_m, new_m);
         float exp_diff = exp2f(__bfloat162float(m - new_m));
         float new_l;
         float2 new_l2 = {exp_diff * l, 0.0f};
         for (int b_c_idx = 0; b_c_idx < B_c; b_c_idx += nums_in_reg)
         {
-            S_tile_row[b_c_idx / nums_in_reg] = h2exp2(S_tile_row[b_c_idx / nums_in_reg] - (num_reg){new_m, new_m});
+            S_tile_row[b_c_idx / nums_in_reg] = h2exp2(S_tile_row[b_c_idx / nums_in_reg] - new_m_reg);
             float2 s_floats = __bfloat1622float2(S_tile_row[b_c_idx / nums_in_reg]);
             new_l2.x += s_floats.x;
             new_l2.y += s_floats.y;
@@ -617,14 +618,29 @@ __global__ void __launch_bounds__(max_threads) flash_attention(
         m = new_m;
         l = new_l;
     }
-    // shmem->ls[b_r_idx] = l;
+    shmem->ls[b_r_idx] = l;
     __syncthreads();
-    for (int d_idx = d_split_start; d_idx < d_split_end; d_idx++)
+    if (params.dim_stride == 1 && max_d % 4 == 0 && params.head_dim == max_d && b_r_limit == B_r)
     {
-        int o_idx = b_r_idx * params.token_stride + d_idx * params.dim_stride;
-        if (b_r_idx < b_r_limit)
+        for (int block_idx = thread_idx; block_idx < B_r * max_d; block_idx += threads)
         {
-            tile_o[o_idx] = __float2bfloat16(shmem->O_tile[b_r_idx * max_d + d_idx] / l);
+            int b_r_idx = block_idx / max_d;
+            int d_idx = block_idx % max_d;
+            int o_idx = b_r_idx * params.token_stride + d_idx * params.dim_stride;
+            float o_val = shmem->O_tile[b_r_idx * max_d + d_idx];
+            float cur_l = shmem->ls[b_r_idx];
+            tile_o[o_idx] = __float2bfloat16(o_val / cur_l);
+        }
+    }
+    else
+    {
+        for (int d_idx = d_split_start; d_idx < d_split_end; d_idx++)
+        {
+            int o_idx = b_r_idx * params.token_stride + d_idx * params.dim_stride;
+            if (b_r_idx < b_r_limit)
+            {
+                tile_o[o_idx] = __float2bfloat16(shmem->O_tile[b_r_idx * max_d + d_idx] / l);
+            }
         }
     }
     if (b_r_idx < b_r_limit)
