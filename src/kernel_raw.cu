@@ -93,7 +93,7 @@ launch_raw_result bench_flash_attention_raw(num *q, num *k, num *v,
     params.seqlen = seqlen;
     params.nheads = nheads;
     params.head_dim = head_dim;
-    params.softmax_scale = rsqrtf(head_dim);
+    params.softmax_scale = rsqrtf(head_dim) * log2(exp(1));
 
     // malloc output tensors
     num *L;
