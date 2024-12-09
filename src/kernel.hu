@@ -513,6 +513,7 @@ __global__ void __launch_bounds__(max_threads) flash_attention(
                 }
             }
         }
+#pragma unroll
         for (int tc_m_idx = 0; tc_m_idx < tc_O_m; tc_m_idx++)
         {
             int b_r_base = tc_m_idx * tc_m_size;
