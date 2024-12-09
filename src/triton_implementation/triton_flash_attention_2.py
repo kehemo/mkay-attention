@@ -158,44 +158,45 @@ def attention_triton_launch(qkv):
         L_batch_stride, L_heads_stride,
         batch_stride, seqlen_stride, nheads_stride,
     )
-    torch.cuda.synchronize()
-    output = torch.zeros_like(q_cont, dtype=qkv.dtype)
-    L = torch.zeros((B, H, N), dtype=qkv.dtype, device=qkv.device)
-    FLOPS = 4 * B * N * H * D * N
-    start = time.time()
-    attention_triton[grid](
-        q_cont, k_cont, v_cont, 
-        output, 1 / math.sqrt(D),
-        qkv_size, N, H, D,
-        L,
-        L_batch_stride, L_heads_stride,
-        batch_stride, seqlen_stride, nheads_stride,
-    )
-    torch.cuda.synchronize()
-    end = time.time()
-    print(f"triton kernel time: {end - start}")
-    print(f"TFLOPS: {FLOPS / (end - start) / 1e12}")
+
     return output
 
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    device = torch.cuda.current_device()
-    properties = driver.active.utils.get_device_properties(device)
-    NUM_SM = properties["multiprocessor_count"]
-    NUM_REGS = properties["max_num_regs"]
-    SIZE_SMEM = properties["max_shared_mem"]
-    WARP_SIZE = properties["warpSize"]
-    target = triton.runtime.driver.active.get_current_target()
-    kernels = {}
-
-    print(f"device stats")
-    print(f"NUM_SM {NUM_SM}, NUM_REGS {NUM_REGS}, SIZE_SMEM {SIZE_SMEM}, WARP_SIZE {WARP_SIZE}")
-    # output: NUM_SM 84, NUM_REGS 65536, SIZE_SMEM 101376, WARP_SIZE 32
-    # 32, 2048, 32, 64
-    batch_size = 32
-    seq_len = 2048
-    n_heads = 32
-    head_dim = 64
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=['N_CTX'],
+        x_vals=[2**i for i in range(10, 13)],
+        line_arg='provider',
+        line_vals=['triton'],
+        line_names=['Triton'],
+        styles=[('red', '-')],
+        ylabel='TFLOPS',
+        plot_name='fused-attention-performance',
+        args={
+            'BATCH': 32,
+            'N_HEADS': 32,
+            'HEAD_DIM': 64,
+        }
+    )
+)
+def benchmark_attention(BATCH, N_HEADS, N_CTX, HEAD_DIM, provider, device='cuda'):
+    dtype = torch.bfloat16
+    qkv = torch.randn((BATCH, N_CTX, 3, N_HEADS, HEAD_DIM), device=device, dtype=dtype)
     
-    qkv = torch.randn(batch_size, seq_len, 3, n_heads, head_dim, device = 'cuda', dtype=torch.bfloat16)
-    attention_triton_launch(qkv)
+    if provider == 'triton':
+        fn = lambda: attention_triton_launch(qkv)
+    
+    # Warmup
+    for _ in range(10):
+        fn()
+    
+    # Benchmark
+    ms = triton.testing.do_bench(fn)
+    
+    # Calculate FLOPS
+    flops_per_matmul = 2.0 * BATCH * N_HEADS * N_CTX * N_CTX * HEAD_DIM
+    total_flops = 2 * flops_per_matmul
+    
+    return total_flops * 1e-12 / (ms * 1e-3)
+
+if __name__ == '__main__':
+    benchmark_attention.run(save_path='.', print_data=True)
