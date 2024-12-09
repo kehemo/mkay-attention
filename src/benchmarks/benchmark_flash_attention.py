@@ -76,10 +76,10 @@ device = 'cuda'
 dtype = torch.bfloat16
 
 # bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
-bs_seqlen_vals = [(1, 8192)]
+bs_seqlen_vals = [(1, 2048)]
 causal_vals = [False, True]
-headdim_vals = [64, 128]
-dim = 2048
+headdim_vals = [128]
+dim = 4096  # So 4096 // 128 = 32 heads
 dropout_p = 0.0
 
 methods = (["Flash2", "Pytorch"]
