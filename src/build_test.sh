@@ -29,5 +29,5 @@ python3 generate_attention_data.py
 cp test*.bin ${CTR_BUILD_DIR}/
 cp test_sizes.csv ${CTR_BUILD_DIR}/
 cp flash_attention_ref.py ${CTR_BUILD_DIR}/
-nvcc -arch=sm_80 -O3 kernel_raw.cu -o ${CTR_BUILD_DIR}/kernel
+nvcc -O3 --use_fast_math -gencode arch=compute_86,code=sm_86 kernel_raw.cu -o ${CTR_BUILD_DIR}/kernel
 echo "Finished build"
