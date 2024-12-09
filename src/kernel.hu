@@ -345,10 +345,7 @@ __global__ void __launch_bounds__(max_threads) flash_attention(
         for (int d_idx = d_split_start; d_idx < d_split_end; d_idx++)
         {
             int q_idx = b_r_idx * params.token_stride + d_idx * params.dim_stride;
-            if (b_r_idx < b_r_limit)
-            {
-                shmem->Q_tile[b_r_idx * padded_d + d_idx] = tile_q[q_idx];
-            }
+            shmem->Q_tile[b_r_idx * padded_d + d_idx] = (b_r_idx < b_r_limit) ? tile_q[q_idx] : __float2bfloat16(0.0f);
         }
     }
 
@@ -393,11 +390,8 @@ __global__ void __launch_bounds__(max_threads) flash_attention(
                 int d_idx = block_idx / B_c;
                 int b_c_idx = block_idx % B_c;
                 int kv_idx = b_c_idx * params.token_stride + d_idx * params.dim_stride;
-                if (b_c_idx < b_c_limit)
-                {
-                    shmem->K_tile[b_c_idx * max_d + d_idx] = tile_k[kv_idx];
-                    shmem->V_tile[b_c_idx * max_d + d_idx] = tile_v[kv_idx];
-                }
+                shmem->K_tile[b_c_idx * max_d + d_idx] = (b_c_idx < b_c_limit) ? tile_k[kv_idx] : __float2bfloat16(0.0f);
+                shmem->V_tile[b_c_idx * max_d + d_idx] = (b_c_idx < b_c_limit) ? tile_v[kv_idx] : __float2bfloat16(0.0f);
             }
         }
         async_memcpy_waitall();
@@ -415,7 +409,7 @@ __global__ void __launch_bounds__(max_threads) flash_attention(
                 {
                     int d_idx = d_base + tc_B_k_offset + tc_B_k_stride[tc_B_idx];
                     int b_c_idx = b_c_base + tc_B_n_offset + tc_B_n_stride[tc_B_idx];
-                    num_reg reg = (d_idx + 1 < params.head_dim && b_c_idx < b_c_limit) ? load_reg(&shmem->K_tile[b_c_idx * max_d + d_idx]) : __halves2bfloat162((d_idx < params.head_dim && b_c_idx < b_c_limit) ? shmem->K_tile[b_c_idx * max_d + d_idx] : __float2bfloat16(0.0f), __float2bfloat16(0.0f));
+                    num_reg reg = load_reg(&shmem->K_tile[b_c_idx * max_d + d_idx]);
                     tc_K[tc_B_idx][tc_k_idx][tc_n_idx] = __BFLOAT162_TO_UI(reg);
                 }
             }
@@ -430,7 +424,7 @@ __global__ void __launch_bounds__(max_threads) flash_attention(
                 {
                     int d_idx = d_base + tc_A_k_offset + tc_A_k_stride[tc_A_idx];
                     int b_r_idx = b_r_base + tc_A_m_offset + tc_A_m_stride[tc_A_idx];
-                    num_reg reg = (d_idx + 1 < params.head_dim && b_r_idx < b_r_limit) ? load_reg(&shmem->Q_tile[b_r_idx * padded_d + d_idx]) : __halves2bfloat162((d_idx < params.head_dim && b_r_idx < b_r_limit) ? shmem->Q_tile[b_r_idx * padded_d + d_idx] : __float2bfloat16(0.0f), __float2bfloat16(0.0f));
+                    num_reg reg = load_reg(&shmem->Q_tile[b_r_idx * padded_d + d_idx]);
                     tc_Q[tc_A_idx][tc_k_idx] = __BFLOAT162_TO_UI(reg);
                 }
             }
@@ -489,9 +483,9 @@ __global__ void __launch_bounds__(max_threads) flash_attention(
         }
         for (int b_c_idx = 0; b_c_idx < B_c; b_c_idx++)
         {
-            if (b_c_idx >= b_c_split_start && b_c_idx < b_c_split_end)
+            if (b_c_idx >= b_c_split_start && b_c_idx < b_c_split_start + B_c_split_size)
             {
-                shmem->S_tile[b_r_idx * padded_B_c + b_c_idx] = S_tile_row[b_c_idx];
+                shmem->S_tile[b_r_idx * padded_B_c + b_c_idx] = (b_r_idx < b_r_limit && b_c_idx < b_c_split_end) ? S_tile_row[b_c_idx] : __float2bfloat16(0.0f);
             }
         }
         shmem->exp_diffs[b_r_idx] = exp_diff;
@@ -524,7 +518,7 @@ __global__ void __launch_bounds__(max_threads) flash_attention(
                 {
                     int b_c_idx = b_c_base + tc_A_k_offset + tc_A_k_stride[tc_A_idx];
                     int b_r_idx = b_r_base + tc_A_m_offset + tc_A_m_stride[tc_A_idx];
-                    num_reg reg = (b_c_idx + 1 < b_c_limit && b_r_idx < b_r_limit) ? load_reg(&shmem->S_tile[b_r_idx * padded_B_c + b_c_idx]) : __halves2bfloat162((b_c_idx < b_c_limit && b_r_idx < b_r_limit) ? shmem->S_tile[b_r_idx * padded_B_c + b_c_idx] : __float2bfloat16(0.0f), __float2bfloat16(0.0f));
+                    num_reg reg = load_reg(&shmem->S_tile[b_r_idx * padded_B_c + b_c_idx]);
                     tc_P[tc_A_idx][tc_k_idx] = __BFLOAT162_TO_UI(reg);
                 }
             }
