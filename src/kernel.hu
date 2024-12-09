@@ -502,7 +502,7 @@ __global__ void __launch_bounds__(max_threads) flash_attention(
                 {
                     int b_c_idx = b_c_base + tc_B_k_offset + tc_B_k_stride[tc_B_idx];
                     int d_idx = d_base + tc_B_n_offset + tc_B_n_stride[tc_B_idx];
-                    num_reg reg = __halves2bfloat162((b_c_idx < b_c_limit && d_idx < params.head_dim) ? shmem->V_tile[b_c_idx * max_d + d_idx] : __float2bfloat16(0.0f), (b_c_idx + 1 < b_c_limit && d_idx < params.head_dim) ? shmem->V_tile[(b_c_idx + 1) * max_d + d_idx] : __float2bfloat16(0.0f));
+                    num_reg reg = __halves2bfloat162(shmem->V_tile[b_c_idx * max_d + d_idx], shmem->V_tile[(b_c_idx + 1) * max_d + d_idx]);
                     tc_V[tc_B_idx][tc_k_idx][tc_n_idx] = __BFLOAT162_TO_UI(reg);
                 }
             }
