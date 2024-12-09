@@ -253,6 +253,7 @@ __device__ num_reg load_reg(num *addr)
 constexpr int nums_in_vec = sizeof(float4) / sizeof(num);
 constexpr int shmem_max_size = 100000;
 constexpr int d_padding = nums_in_vec;
+constexpr int b_c_padding = 2;
 
 template <int B_r, int B_c_split_size, int d_split_size, int splits>
 struct shmem_t
@@ -260,7 +261,9 @@ struct shmem_t
     num K_tile[B_c_split_size * splits * (d_split_size * splits)];
     num V_tile[B_c_split_size * splits * (d_split_size * splits)];
     num Q_tile[B_r * (d_split_size * splits + d_padding)];
-    num S_tile[B_r * B_c_split_size * splits];
+    num S_tile[B_r * (B_c_split_size * splits + b_c_padding)];
+    float exp_diffs[B_r];
+    float ls[B_r];
 };
 
 constexpr __host__ __device__ int ceil_div(int a, int b)
@@ -323,6 +326,7 @@ __global__ void __launch_bounds__(max_threads) flash_attention(
     int b_c_split_start = split_idx * B_c_split_size;
     int b_c_split_end = min((split_idx + 1) * B_c_split_size, params.seqlen);
     constexpr int B_c = B_c_split_size * splits;
+    constexpr int padded_B_c = B_c + b_c_padding;
     constexpr int max_d = d_split_size * splits;
     constexpr int padded_d = max_d + d_padding;
 
@@ -348,16 +352,21 @@ __global__ void __launch_bounds__(max_threads) flash_attention(
         }
     }
 
-    float o_reg[d_split_size] = {0};
-    constexpr int tc_S_m = ceil_div(B_r, tc_m_size);
-    constexpr int tc_S_n = ceil_div(B_c, tc_n_size * warps);
-    constexpr int tc_S_k = ceil_div(max_d, tc_k_size);
     int tc_A_m_offset = warp_thread_idx / 4;
     int tc_A_k_offset = (warp_thread_idx % 4) * 2;
     int tc_B_k_offset = (warp_thread_idx % 4) * 2;
     int tc_B_n_offset = warp_thread_idx / 4 + warp_idx * tc_n_size;
     int tc_CD_m_offset = warp_thread_idx / 4;
     int tc_CD_n_offset = (warp_thread_idx % 4) * 2 + warp_idx * tc_n_size;
+
+    constexpr int tc_n_warp_size = tc_n_size * warps;
+    constexpr int tc_S_m = ceil_div(B_r, tc_m_size);
+    constexpr int tc_S_n = ceil_div(B_c, tc_n_warp_size);
+    constexpr int tc_S_k = ceil_div(max_d, tc_k_size);
+    constexpr int tc_O_m = ceil_div(B_r, tc_m_size);
+    constexpr int tc_O_n = ceil_div(max_d, tc_n_warp_size);
+    constexpr int tc_O_k = ceil_div(B_c, tc_k_size);
+    uint tc_O[tc_CD_size][tc_O_m][tc_O_n] = {0};
 
     int T_c = ceil_div(params.seqlen, B_c);
     for (int j = 0; j < T_c; j++)
@@ -397,6 +406,7 @@ __global__ void __launch_bounds__(max_threads) flash_attention(
         uint tc_Q[tc_A_size][tc_S_m][tc_S_k];
         uint tc_K[tc_B_size][tc_S_k][tc_S_n];
         uint tc_S[tc_CD_size][tc_S_m][tc_S_n] = {0};
+#pragma unroll
         for (int tc_k_idx = 0; tc_k_idx < tc_S_k; tc_k_idx++)
         {
             int d_base = tc_k_size * tc_k_idx;
@@ -413,7 +423,7 @@ __global__ void __launch_bounds__(max_threads) flash_attention(
             }
             for (int tc_n_idx = 0; tc_n_idx < tc_S_n; tc_n_idx++)
             {
-                int b_c_base = tc_n_idx * tc_n_size * warps;
+                int b_c_base = tc_n_idx * tc_n_warp_size;
                 for (int tc_B_idx = 0; tc_B_idx < tc_B_size; tc_B_idx++)
                 {
                     int d_idx = d_base + tc_B_k_offset + tc_B_k_stride[tc_B_idx];
@@ -428,7 +438,7 @@ __global__ void __launch_bounds__(max_threads) flash_attention(
             int b_r_base = tc_m_idx * tc_m_size;
             for (int tc_n_idx = 0; tc_n_idx < tc_S_n; tc_n_idx++)
             {
-                int b_c_base = tc_n_idx * tc_n_size * warps;
+                int b_c_base = tc_n_idx * tc_n_warp_size;
                 for (int tc_k_idx = 0; tc_k_idx < tc_S_k; tc_k_idx++)
                 {
                     asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32"
@@ -457,52 +467,117 @@ __global__ void __launch_bounds__(max_threads) flash_attention(
                     int b_c_idx = b_c_base + tc_CD_n_offset + tc_CD_n_stride[tc_CD_idx];
                     if (b_r_idx < b_r_limit && b_c_idx < b_c_limit)
                     {
-                        shmem->S_tile[b_r_idx + b_c_idx * B_r] = __float2bfloat16(__uint_as_float(tc_S[tc_CD_idx][tc_m_idx][tc_n_idx]) * params.softmax_scale);
+                        shmem->S_tile[b_r_idx * padded_B_c + b_c_idx] = __float2bfloat16(__uint_as_float(tc_S[tc_CD_idx][tc_m_idx][tc_n_idx]) * params.softmax_scale);
                     }
                 }
             }
         }
         __syncthreads();
+        num S_tile_row[B_c];
         num new_m = m;
-        for (int b_c_idx = 0; b_c_idx < b_c_limit; b_c_idx++)
+        for (int b_c_idx = 0; b_c_idx < B_c; b_c_idx++)
         {
-            new_m = __hmax(new_m, shmem->S_tile[b_r_idx + b_c_idx * B_r]);
+            num s_val = shmem->S_tile[b_r_idx * padded_B_c + b_c_idx];
+            new_m = __hmax(new_m, s_val);
+            S_tile_row[b_c_idx] = s_val;
         }
-        __syncthreads();
         float exp_diff = expf(__bfloat162float(m - new_m));
-        for (int b_c_idx = b_c_split_start; b_c_idx < b_c_split_end; b_c_idx++)
-        {
-            num p = hexp(shmem->S_tile[b_r_idx + b_c_idx * B_r] - __float2bfloat16(new_m));
-            shmem->S_tile[b_r_idx + b_c_idx * B_r] = p;
-        }
-        __syncthreads();
         float new_l = exp_diff * l;
-        for (int b_c_idx = 0; b_c_idx < b_c_limit; b_c_idx++)
+        for (int b_c_idx = 0; b_c_idx < B_c; b_c_idx++)
         {
-            new_l += __bfloat162float(shmem->S_tile[b_r_idx + b_c_idx * B_r]);
+            S_tile_row[b_c_idx] = hexp(S_tile_row[b_c_idx] - __float2bfloat16(new_m));
+            new_l += b_c_idx < b_c_limit ? __bfloat162float(S_tile_row[b_c_idx]) : 0.0f;
         }
-        for (int d_split_idx = 0; d_split_idx < d_split_size; d_split_idx++)
+        for (int b_c_idx = 0; b_c_idx < B_c; b_c_idx++)
         {
-            o_reg[d_split_idx] *= exp_diff;
+            shmem->S_tile[b_r_idx * padded_B_c + b_c_idx] = S_tile_row[b_c_idx];
         }
-        for (int b_c_idx = 0; b_c_idx < b_c_limit; b_c_idx++)
+        shmem->exp_diffs[b_r_idx] = exp_diff;
+        __syncthreads();
+        uint tc_P[tc_A_size][tc_O_m][tc_O_k];
+        uint tc_V[tc_B_size][tc_O_k][tc_O_n];
+#pragma unroll
+        for (int tc_k_idx = 0; tc_k_idx < tc_O_k; tc_k_idx++)
         {
-            for (int d_split_idx = 0; d_split_idx < d_split_size; d_split_idx++)
+            int b_c_base = tc_k_idx * tc_k_size;
+            for (int tc_m_idx = 0; tc_m_idx < tc_O_m; tc_m_idx++)
             {
-                int d_idx = d_split_idx + d_split_start;
-                o_reg[d_split_idx] += __bfloat162float(shmem->S_tile[b_r_idx + b_c_idx * B_r]) * __bfloat162float(shmem->V_tile[b_c_idx * max_d + d_idx]);
+                int b_r_base = tc_m_idx * tc_m_size;
+                for (int tc_A_idx = 0; tc_A_idx < tc_A_size; tc_A_idx++)
+                {
+                    int b_c_idx = b_c_base + tc_A_k_offset + tc_A_k_stride[tc_A_idx];
+                    int b_r_idx = b_r_base + tc_A_m_offset + tc_A_m_stride[tc_A_idx];
+                    num_reg reg = (b_c_idx + 1 < b_c_limit && b_r_idx < b_r_limit) ? load_reg(&shmem->S_tile[b_r_idx * padded_B_c + b_c_idx]) : __halves2bfloat162((b_c_idx < b_c_limit && b_r_idx < b_r_limit) ? shmem->S_tile[b_r_idx * padded_B_c + b_c_idx] : __float2bfloat16(0.0f), __float2bfloat16(0.0f));
+                    tc_P[tc_A_idx][tc_m_idx][tc_k_idx] = __BFLOAT162_TO_UI(reg);
+                }
+            }
+            for (int tc_n_idx = 0; tc_n_idx < tc_O_n; tc_n_idx++)
+            {
+                int d_base = tc_n_idx * tc_n_warp_size;
+                for (int tc_B_idx = 0; tc_B_idx < tc_B_size; tc_B_idx++)
+                {
+                    int b_c_idx = b_c_base + tc_B_k_offset + tc_B_k_stride[tc_B_idx];
+                    int d_idx = d_base + tc_B_n_offset + tc_B_n_stride[tc_B_idx];
+                    num_reg reg = __halves2bfloat162((b_c_idx < b_c_limit && d_idx < params.head_dim) ? shmem->V_tile[b_c_idx * max_d + d_idx] : __float2bfloat16(0.0f), (b_c_idx + 1 < b_c_limit && d_idx < params.head_dim) ? shmem->V_tile[(b_c_idx + 1) * max_d + d_idx] : __float2bfloat16(0.0f));
+                    tc_V[tc_B_idx][tc_k_idx][tc_n_idx] = __BFLOAT162_TO_UI(reg);
+                }
+            }
+        }
+        for (int tc_m_idx = 0; tc_m_idx < tc_O_m; tc_m_idx++)
+        {
+            int b_r_base = tc_m_idx * tc_m_size;
+            for (int tc_n_idx = 0; tc_n_idx < tc_O_n; tc_n_idx++)
+            {
+                for (int tc_CD_idx = 0; tc_CD_idx < tc_CD_size; tc_CD_idx++)
+                {
+                    int b_r_idx = b_r_base + tc_CD_m_offset + tc_CD_m_stride[tc_CD_idx];
+                    tc_O[tc_CD_idx][tc_m_idx][tc_n_idx] = __float_as_uint(__uint_as_float(tc_O[tc_CD_idx][tc_m_idx][tc_n_idx]) * shmem->exp_diffs[b_r_idx]);
+                }
+                for (int tc_k_idx = 0; tc_k_idx < tc_O_k; tc_k_idx++)
+                {
+                    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32"
+                        "{%0, %1, %2, %3},     /* 'D' matrix */"
+                        "{%4, %5, %6, %7},     /* 'A' matrix */"
+                        "{%8, %9},             /* 'B' matrix */"
+                        "{%10, %11, %12, %13}; /* 'C' matrix */"
+                        : "+r"(tc_O[0][tc_m_idx][tc_n_idx]),
+                          "+r"(tc_O[1][tc_m_idx][tc_n_idx]),
+                          "+r"(tc_O[2][tc_m_idx][tc_n_idx]),
+                          "+r"(tc_O[3][tc_m_idx][tc_n_idx])
+                        : "r"(tc_P[0][tc_m_idx][tc_k_idx]),
+                          "r"(tc_P[1][tc_m_idx][tc_k_idx]),
+                          "r"(tc_P[2][tc_m_idx][tc_k_idx]),
+                          "r"(tc_P[3][tc_m_idx][tc_k_idx]),
+                          "r"(tc_V[0][tc_k_idx][tc_n_idx]),
+                          "r"(tc_V[1][tc_k_idx][tc_n_idx]),
+                          "r"(tc_O[0][tc_m_idx][tc_n_idx]),
+                          "r"(tc_O[1][tc_m_idx][tc_n_idx]),
+                          "r"(tc_O[2][tc_m_idx][tc_n_idx]),
+                          "r"(tc_O[3][tc_m_idx][tc_n_idx]));
+                }
             }
         }
         m = new_m;
         l = new_l;
     }
-    for (int d_split_idx = 0; d_split_idx < d_split_size; d_split_idx++)
+    shmem->ls[b_r_idx] = l;
+    __syncthreads();
+    for (int tc_m_idx = 0; tc_m_idx < tc_O_m; tc_m_idx++)
     {
-        int d_idx = d_split_start + d_split_idx;
-        int o_idx = b_r_idx * params.token_stride + d_idx * params.dim_stride;
-        if (d_idx < params.head_dim && b_r_idx < b_r_limit)
+        int b_r_base = tc_m_idx * tc_m_size;
+        for (int tc_n_idx = 0; tc_n_idx < tc_O_n; tc_n_idx++)
         {
-            tile_o[o_idx] = __float2bfloat16(o_reg[d_split_idx] / l);
+            int d_base = tc_n_idx * tc_n_warp_size;
+            for (int tc_CD_idx = 0; tc_CD_idx < tc_CD_size; tc_CD_idx++)
+            {
+                int b_r_idx = b_r_base + tc_CD_m_offset + tc_CD_m_stride[tc_CD_idx];
+                int d_idx = d_base + tc_CD_n_offset + tc_CD_n_stride[tc_CD_idx];
+                int o_idx = b_r_idx * params.token_stride + d_idx * params.dim_stride;
+                if (d_idx < params.head_dim && b_r_idx < b_r_limit)
+                {
+                    tile_o[o_idx] = __float2bfloat16(__uint_as_float(tc_O[tc_CD_idx][tc_m_idx][tc_n_idx]) / shmem->ls[b_r_idx]);
+                }
+            }
         }
     }
     if (b_r_idx < b_r_limit)
