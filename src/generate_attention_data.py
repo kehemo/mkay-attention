@@ -40,4 +40,4 @@ def write_example(batch_size, seqlen, nheads, headdim):
     print(f"Wrote {v_fname!r}")
 
 
-write_example(2, 32, 64, 32)
+write_example(32, 128, 32, 64)

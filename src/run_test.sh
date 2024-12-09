@@ -8,5 +8,6 @@
 # -----     * feel free to execute `ls` form here to check the content of the workdir
 # ----------------------------------------------------------------------------------
 
-./kernel
+# ./kernel
+python3 triton_implementation/triton_flash_attention_2.py
 python3 triton_implementation/triton_check.py

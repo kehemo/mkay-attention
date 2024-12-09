@@ -116,7 +116,7 @@ struct test_config
 
 int main(void)
 {
-    std::vector<test_config> configs = {{2, 32, 64, 32}};
+    std::vector<test_config> configs = {{32, 128, 32, 64}};
     for (auto config : configs)
     {
         std::string test_pref = "test_" + std::to_string(config.batch_size) + "x" + std::to_string(config.seqlen) + "x" + std::to_string(config.nheads) + "x" + std::to_string(config.headdim);

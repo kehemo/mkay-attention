@@ -1,6 +1,8 @@
 import torch
 import triton
 import triton.language as tl
+from triton.runtime import driver
+import time
 import math
 
 """
@@ -9,9 +11,17 @@ CUDA_VISIBLE_DEVICES=1 TRITON_PRINT_AUTOTUNING=1 python3 flash.py
 
 
 def get_cuda_autotune_config():
-    return [
-        triton.Config({'Br': 32, 'Bc': 32}, num_stages=4, num_warps=8),
-    ]
+    num_stages_list = [4, 8]
+    num_warps_list = [4, 8, 16]
+    Br_list = [64, 128]
+    Bc_list = [64, 128]
+    configs = []
+    for num_stages in num_stages_list:
+        for num_warps in num_warps_list:
+            for Br in Br_list:
+                for Bc in Bc_list:
+                    configs.append(triton.Config({'Br': Br, 'Bc': Bc}, num_stages=num_stages, num_warps=num_warps))
+    return configs
 @triton.autotune(
     configs=get_cuda_autotune_config(),
     key=['seqlen', 'hdim'],
@@ -20,11 +30,18 @@ def get_cuda_autotune_config():
 def attention_triton(
     q, k, v, 
     output, softmax_score,
-    seqlen, nheads, hdim: tl.constexpr,
+    qkv_size, seqlen, nheads, hdim: tl.constexpr,
     L, 
     L_batch_stride, L_heads_stride,
     batch_stride, seqlen_stride, nheads_stride, 
     Br : tl.constexpr, Bc : tl.constexpr):
+    # compiler hints, i am unsure how to use these
+    # tl.max_constancy(q, qkv_size)
+    # tl.max_constancy(k, qkv_size)
+    # tl.max_constancy(v, qkv_size)
+    # tl.max_contiguous(q, qkv_size)
+    # tl.max_contiguous(k, qkv_size)
+    # tl.max_contiguous(v, qkv_size)
 
     batch_id = tl.program_id(0)
     head_id = tl.program_id(1)
@@ -83,7 +100,7 @@ def attention_triton(
     
     # set up li, mi
     li = tl.zeros((Br,), dtype=tl.float32)
-    mi = tl.zeros((Br,), dtype=tl.float32) - float("inf")
+    mi = tl.full((Br,), -1e9, dtype=tl.float32)
 
     Qi = tl.load(q_block_ptr)
     Oi = tl.zeros((Br, hdim), dtype=tl.float32)
@@ -94,11 +111,13 @@ def attention_triton(
         Vj = tl.load(v_block_ptr)
         
         # Sij: (Br, Bc)
-        Sij = tl.dot(Qi, tl.trans(Kj)) * softmax_score
+        Sij = (tl.dot(Qi, tl.trans(Kj)) * softmax_score)
         mi_new = tl.maximum(mi, tl.max(Sij, axis = 1))
         P_t_ij = tl.exp(Sij - mi_new[:, None])
+        P_t_ij = P_t_ij.to(tl.bfloat16)
         li_new = tl.exp(mi - mi_new) * li + tl.sum(P_t_ij, axis = 1)
-        Oi = tl.exp(mi - mi_new)[:, None] * Oi + tl.dot(P_t_ij, Vj) 
+        Oi = tl.exp(mi - mi_new)[:, None] * Oi
+        Oi = tl.dot(P_t_ij, Vj, Oi) 
 
         # advance the block pointers
         k_block_ptr = tl.advance(k_block_ptr, (Bc, 0))
@@ -107,17 +126,19 @@ def attention_triton(
         li = li_new
         
     Oi = (1 / li[:, None]) * Oi
+    Oi = Oi.to(tl.bfloat16)
     Li = mi + tl.log(li)
+    Li = Li.to(tl.bfloat16)
     tl.store(out_block_ptr, Oi)
     tl.store(L_ptrs, Li, mask = L_mask)
 
 def attention_triton_launch(qkv):
-    qkv = qkv.to(torch.float32)
     q, k, v = qkv.unbind(dim=2)
     q_cont, k_cont, v_cont = q.contiguous(), k.contiguous(), v.contiguous()
     output = torch.zeros_like(q_cont, dtype=qkv.dtype)
 
     B, N, H, D = q_cont.shape
+    qkv_size = q.numel()
     L = torch.zeros((B, H, N), dtype=qkv.dtype, device=qkv.device)
 
     L_batch_stride, L_heads_stride, _ = L.stride()
@@ -128,14 +149,53 @@ def attention_triton_launch(qkv):
         Tr = triton.cdiv(N, META['Br'])
         return (B, H, Tr)
 
-
+    # compile the kernel
     attention_triton[grid](
         q_cont, k_cont, v_cont, 
         output, 1 / math.sqrt(D),
-        N, H, D,
+        qkv_size, N, H, D,
         L,
         L_batch_stride, L_heads_stride,
         batch_stride, seqlen_stride, nheads_stride,
     )
+    torch.cuda.synchronize()
+    output = torch.zeros_like(q_cont, dtype=qkv.dtype)
+    L = torch.zeros((B, H, N), dtype=qkv.dtype, device=qkv.device)
+    FLOPS = 4 * B * N * H * D * N
+    start = time.time()
+    attention_triton[grid](
+        q_cont, k_cont, v_cont, 
+        output, 1 / math.sqrt(D),
+        qkv_size, N, H, D,
+        L,
+        L_batch_stride, L_heads_stride,
+        batch_stride, seqlen_stride, nheads_stride,
+    )
+    torch.cuda.synchronize()
+    end = time.time()
+    print(f"triton kernel time: {end - start}")
+    print(f"TFLOPS: {FLOPS / (end - start) / 1e12}")
+    return output
 
-    return output.to(torch.bfloat16)
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    device = torch.cuda.current_device()
+    properties = driver.active.utils.get_device_properties(device)
+    NUM_SM = properties["multiprocessor_count"]
+    NUM_REGS = properties["max_num_regs"]
+    SIZE_SMEM = properties["max_shared_mem"]
+    WARP_SIZE = properties["warpSize"]
+    target = triton.runtime.driver.active.get_current_target()
+    kernels = {}
+
+    print(f"device stats")
+    print(f"NUM_SM {NUM_SM}, NUM_REGS {NUM_REGS}, SIZE_SMEM {SIZE_SMEM}, WARP_SIZE {WARP_SIZE}")
+    # output: NUM_SM 84, NUM_REGS 65536, SIZE_SMEM 101376, WARP_SIZE 32
+    # 32, 2048, 32, 64
+    batch_size = 32
+    seq_len = 2048
+    n_heads = 32
+    head_dim = 64
+    
+    qkv = torch.randn(batch_size, seq_len, 3, n_heads, head_dim, device = 'cuda', dtype=torch.bfloat16)
+    attention_triton_launch(qkv)

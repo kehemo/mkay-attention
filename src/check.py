@@ -88,14 +88,14 @@ def check(batch_size, seqlen, nheads, headdim, run_id):
     print(f"problem size:")
     print(f"q/k/v shape = {(batch_size, seqlen, nheads, headdim)}")
     torch_output = attention_torch_checkpoint(qkv)
-    cuda_output = from_file(o_fname, dtype, dims=(batch_size, seqlen, nheads, headdim))
+    # cuda_output = from_file(o_fname, dtype, dims=(batch_size, seqlen, nheads, headdim))
     triton_output = from_file(triton_o_fname, dtype = torch.float32, dims=(batch_size, seqlen, nheads, headdim))
     triton_output = triton_output.to(dtype=torch.bfloat16)
 
-    print("CUDA output compared to Torch output:")
-    get_tensor_difference(torch_output, cuda_output)
-    rel_rmse = compute_relative_rmse(torch_output, cuda_output)
-    print(f"\n\n>>> Relative RMSE: {rel_rmse}")
+    # print("CUDA output compared to Torch output:")
+    # get_tensor_difference(torch_output, cuda_output)
+    # rel_rmse = compute_relative_rmse(torch_output, cuda_output)
+    # print(f"\n\n>>> Relative RMSE: {rel_rmse}")
 
     print("Triton output compared to Torch output:")
     get_tensor_difference(torch_output, triton_output)
@@ -103,4 +103,4 @@ def check(batch_size, seqlen, nheads, headdim, run_id):
     print(f"\n\n>>> Relative RMSE: {rel_rmse}")
 
 run_id = sys.argv[1]
-check(2, 32, 64, 32, run_id)
+check(32, 128, 32, 64, run_id)

@@ -19,7 +19,7 @@ class TestConfig:
     headdim: int
 
 def main():
-    configs = [TestConfig(2, 32, 64, 32)]
+    configs = [TestConfig(32, 128, 32, 64)]
     dtype = torch.bfloat16
 
     for config in configs:
