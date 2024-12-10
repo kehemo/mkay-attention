@@ -556,34 +556,35 @@ except BaseException:
 TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
 BATCH, N_HEADS, HEAD_DIM = 4, 32, 64
 # vary seq length for fixed head and batch=4
-configs = []
-for mode in ["fwd"]:
+fwd_configs = []
+bwd_configs = []
+for mode in ["fwd", "bwd"]:
     for causal in [False]:
-        if mode == "bwd" and not causal:
-            continue
-        configs.append(
-            triton.testing.Benchmark(
-                x_names=["N_CTX"],
-                x_vals=[2**i for i in range(10, 13)],
-                line_arg="provider",
-                line_vals=["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []) +
-                (["flash"] if HAS_FLASH else []),
-                line_names=["Triton [FP16]"] + (["Triton [FP8]"] if TORCH_HAS_FP8 else []) +
-                (["Flash-2"] if HAS_FLASH else []),
-                styles=[("red", "-"), ("blue", "-"), ("green", "-")],
-                ylabel="TFLOPS",
-                plot_name=f"fused-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}-{mode}-causal={causal}",
-                args={
-                    "H": N_HEADS,
-                    "BATCH": BATCH,
-                    "HEAD_DIM": HEAD_DIM,
-                    "mode": mode,
-                    "causal": causal,
-                },
-            ))
+            config = triton.testing.Benchmark(
+                    x_names=["N_CTX"],
+                    x_vals=[2**i for i in (range(10, 13) if mode == "fwd" else range(8, 11))],
+                    line_arg="provider",
+                    line_vals=["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []) +
+                    (["flash"] if HAS_FLASH else []),
+                    line_names=["Triton [FP16]"] + (["Triton [FP8]"] if TORCH_HAS_FP8 else []) +
+                    (["Flash-2"] if HAS_FLASH else []),
+                    styles=[("red", "-"), ("blue", "-"), ("green", "-")],
+                    ylabel="TFLOPS",
+                    plot_name=f"fused-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}-{mode}-causal={causal}",
+                    args={
+                        "H": N_HEADS,
+                        "BATCH": BATCH,
+                        "HEAD_DIM": HEAD_DIM,
+                        "mode": mode,
+                        "causal": causal,
+                    },
+                )
+            if mode == "fwd":
+                fwd_configs.append(config)
+            else:
+                bwd_configs.append(config)
 
 
-@triton.testing.perf_report(configs)
 def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, device="cuda"):
     assert mode in ["fwd", "bwd"]
     dtype = torch.float16
@@ -620,7 +621,15 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, dev
         total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
     return total_flops * 1e-12 / (ms * 1e-3)
 
+@triton.testing.perf_report(fwd_configs)
+def bench_flash_attention_fwd(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, device="cuda"):
+    return bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, device)
+
+@triton.testing.perf_report(bwd_configs)
+def bench_flash_attention_bwd(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, device="cuda"):
+    return bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, device)
+
 
 if __name__ == "__main__":
     # only works on post-Ampere GPUs right now
-    bench_flash_attention.run(save_path=".", print_data=True)
+    bench_flash_attention_bwd.run(save_path=".", print_data=True)

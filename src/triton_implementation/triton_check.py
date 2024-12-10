@@ -2,7 +2,7 @@ import io
 import torch
 from dataclasses import dataclass
 # import triton_naive_attention
-import triton_flash_attention_2
+import src.triton_implementation.triton_flash_attention_2_forwards as triton_flash_attention_2_forwards
 from ctypes import *
 
 def from_file(fname, dtype, dims):
@@ -31,7 +31,7 @@ def main():
         qkv = torch.stack((q, k, v), dim=2)
         qkv = qkv.to("cuda")
         
-        result = triton_flash_attention_2.attention_triton_launch(qkv)
+        result = triton_flash_attention_2_forwards.attention_triton_launch(qkv)
         out = result.cpu()
         out_float32 = out.to(torch.float32)
         out_float32.numpy().tofile(f"out/triton_{test_pref}_o.bin")
