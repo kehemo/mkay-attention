@@ -168,33 +168,33 @@ def flash2_bwd_prep(
             D_batch_stride, D_heads_stride,
             O_batch_stride, O_heads_stride, O_seqlen_stride,
             dO_batch_stride, dO_heads_stride, dO_seqlen_stride,
-            TOKEN_BLOCK: tl.constexpr):
+            Br: tl.constexpr):
     """
     O_ptr: (batch_sz, seqlen, nheads, hdim)
     dO_ptr: (batch_sz, seqlen, nheads, hdim)
     D_ptr: (batch_sz, nheads, seqlen)
     """
-    token_block_id = tl.program_id(axis = 0)
+    Tr_i = tl.program_id(axis = 0)
     batch_id = tl.program_id(axis = 1)
     head_id = tl.program_id(axis = 2)
 
-    token_block_offset = token_block_id * TOKEN_BLOCK
+    i_offset = Tr_i * Br
     BH_offset = batch_id * O_batch_stride + head_id * O_heads_stride
 
     O_block_ptr = tl.make_block_ptr(
         base = O_ptr + BH_offset,
         shape = (seqlen, hdim),
         strides = (O_seqlen_stride, 1),
-        offsets = (token_block_offset, 0),
-        block_shape = (TOKEN_BLOCK, hdim),
+        offsets = (i_offset, 0),
+        block_shape = (Br, hdim),
         order = (1, 0)
     )
     dO_block_ptr = tl.make_block_ptr(
         base = dO_ptr + BH_offset,
         shape = (seqlen, hdim),
         strides = (dO_seqlen_stride, 1),
-        offsets = (token_block_offset, 0),
-        block_shape = (TOKEN_BLOCK, hdim),
+        offsets = (i_offset, 0),
+        block_shape = (Br, hdim),
         order = (1, 0)
     )
 
@@ -203,7 +203,7 @@ def flash2_bwd_prep(
     dO = tl.load(dO_block_ptr)
 
     D = tl.sum(O * dO, axis = 1)
-    D_ptrs = D_ptr + batch_id * D_batch_stride + head_id * D_heads_stride + token_block_offset + tl.arange(0, TOKEN_BLOCK)
+    D_ptrs = D_ptr + batch_id * D_batch_stride + head_id * D_heads_stride + i_offset + tl.arange(0, Br)
     tl.store(D_ptrs, D)
 
 @triton.jit
@@ -310,20 +310,6 @@ def flash2_bwd_dq(
 
     tl.store(dQ_block_ptr, dQi)
 
-"""
-@triton.jit
-def flash2_bwd_dq(
-    Q_ptr, K_ptr, V_ptr, O_ptr, dO_ptr, L_ptr, D_ptr,
-    dK_ptr, dV_ptr,
-    softmax_scale, ln2,
-    batch_sz, nheads, seqlen, hdim: tl.constexpr,
-    dO_batch_stride, dO_seqlen_stride, dO_heads_stride,
-    QKV_batch_stride, QKV_seqlen_stride, QKV_heads_stride,
-    LD_batch_stride, LD_heads_stride,
-    Bc: tl.constexpr, Br: tl.constexpr
-):
-"""
-
 @triton.jit
 def flash2_bwd_dkdv(
     Q_ptr, K_ptr, V_ptr, dO_ptr,
@@ -383,7 +369,6 @@ def flash2_bwd_dkdv(
 
     Tr = tl.cdiv(seqlen, Br)
     for i in range(Tr):
-    # for i in range(1):
         Qi = tl.load(Q_block_ptr)
         dOi = tl.load(dO_block_ptr)
 
@@ -428,7 +413,6 @@ def flash2_bwd_dkdv(
     tl.store(dV_block_ptr, dVj)
 
 
-
 def flash2_bwd_wrapper(Q, K, V, O, dO, L, softmax_scale):
     Q = Q.contiguous()
     K = K.contiguous()
@@ -439,15 +423,8 @@ def flash2_bwd_wrapper(Q, K, V, O, dO, L, softmax_scale):
     dO = dO.contiguous()
 
     qkv_dtype, qkv_device = Q.dtype, Q.device
-
-
     batch_sz, seqlen, nheads, hdim = Q.shape
-    l = torch.zeros((batch_sz, nheads, seqlen), dtype=qkv_dtype, device=qkv_device)
-    m = torch.ones((batch_sz, nheads, seqlen), dtype=qkv_dtype, device=qkv_device) * float("-inf")
 
-    # l and m will have the same strides
-    lm_batch_stride, lm_heads_stride, _ = m.stride()
-    batch_stride, seqlen_stride, nheads_stride, _ = Q.stride()
 
     D = torch.empty((batch_sz, nheads, seqlen), device=qkv_device, dtype=qkv_dtype)
 
@@ -457,30 +434,23 @@ def flash2_bwd_wrapper(Q, K, V, O, dO, L, softmax_scale):
     D_batch_stride, D_heads_stride, _ = D.stride()
 
 
-    # TODO: add in the prep call
-    def prep_grid(META):
-        assert seqlen % META['TOKEN_BLOCK'] == 0, "seqlen must be divisible by TOKEN_BLOCK, since we don't use a mask" # actually don't think this is necessary anymore?
-        return (triton.cdiv(seqlen, META['TOKEN_BLOCK']), batch_sz, nheads)
-    print(O.device, dO.device, D.device)
+
+    Bc, Br = 16, 16
+    assert seqlen % Br == 0, "seqlen must be divisible by Br, at least it used to be (although maybe we're good on this now that we use block_ptrs?)"
+
+
+    prep_grid = lambda META: ((triton.cdiv(seqlen, Br)), batch_sz, nheads)
     flash2_bwd_prep[prep_grid](
         O, dO, D,
         batch_sz, nheads, seqlen, hdim,
         D_batch_stride, D_heads_stride,
         O_batch_stride, O_heads_stride, O_seqlen_stride,
         dO_batch_stride, dO_heads_stride, dO_seqlen_stride,
-        TOKEN_BLOCK = 32
+        Br = Br
     )
 
-
-    # dQ = torch.empty_like(Q, device = qkv_device, dtype = qkv_dtype)
+    """Compute dQ"""
     dQ = torch.ones_like(Q, device = qkv_device, dtype = qkv_dtype) * -1
-    print(f"dQ stride: {dQ.stride()}")
-    print("QKV strides: ", Q.stride())
-    print("O strides: ", O.stride())
-    print("dO strides: ", dO.stride())
-
-    Bc, Br = 16, 16
-
     QKV_batch_stride, QKV_seqlen_stride, QKV_heads_stride, _ = Q.stride()
     LD_batch_stride, LD_heads_stride, _ = L.stride()
     
@@ -495,17 +465,7 @@ def flash2_bwd_wrapper(Q, K, V, O, dO, L, softmax_scale):
         Bc = Bc, Br = Br
     )
 
-
-    # def flash2_bwd_dkdv(
-    #     Q_ptr, K_ptr, V_ptr, dO_ptr,
-    #     dK_ptr, dV_ptr, D_ptr, L_ptr,
-    #     softmax_scale, ln2,
-    #     batch_sz, nheads, seqlen, hdim: tl.constexpr,
-    #     QKV_batch_stride, QKV_seqlen_stride, QKV_heads_stride,
-    #     LD_batch_stride, LD_heads_stride,
-    #     Bc: tl.constexpr, Br: tl.constexpr
-    # ):
-
+    """Compute dK, dV"""
     dK = torch.empty_like(K, device = qkv_device, dtype = qkv_dtype)
     dV = torch.empty_like(V, device = qkv_device, dtype = qkv_dtype)
     dkdv_grid = lambda META: ((triton.cdiv(seqlen, Bc)), batch_sz, nheads)
@@ -552,12 +512,6 @@ def flash2_triton_bwd_eval(qkv):
     print("triton / naive_dQ RMSE: ", compute_relative_rmse(dQ_flash2, dQ_ground))
     print("triton / naive_dK RMSE: ", compute_relative_rmse(dK_flash2, dK_ground))
     print("triton / naive_dV RMSE: ", compute_relative_rmse(dV_flash2, dV_ground))
-
-    # print("triton / torch dK ratio")
-    # print(dK_flash2[0,:,0,:] / dK_ftorch_spec)
-
-    # print("triton / torch dV ratio")
-    # print(dV_flash2[0,:,0,:] / dV_ftorch_spec)
 
 
 if __name__ == "__main__":
