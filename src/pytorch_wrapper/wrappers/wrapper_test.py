@@ -1,6 +1,7 @@
 import torch
 from torch.autograd import gradcheck
 from naive_wrapped import *
+from new_naive_wrapped import *
 
 def test_custom_attn(attn_func):
     # Set random seed for reproducibility
@@ -35,4 +36,4 @@ def test_custom_attn(attn_func):
     print("All tests passed successfully!")
 
 if __name__ == "__main__":
-    test_custom_attn(naive_AttnQKVPackedFunc)
+    test_custom_attn(baseline_AttnQKVPackedFunc)
