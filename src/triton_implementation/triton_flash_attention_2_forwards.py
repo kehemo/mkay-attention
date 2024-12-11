@@ -12,13 +12,15 @@ CUDA_VISIBLE_DEVICES=1 TRITON_PRINT_AUTOTUNING=1 python3 flash.py
 
 def get_cuda_autotune_config():
     num_stages_list = [4, 8]
+    num_warps_list = [4, 8, 16]
     Br_list = [64, 128, 256]
     Bc_list = [32, 64, 128, 256]
     configs = []
     for num_stages in num_stages_list:
-        for Br in Br_list:
-            for Bc in Bc_list:
-                configs.append(triton.Config({'Br': Br, 'Bc': Bc}, num_stages=num_stages))
+        for num_warps in num_warps_list:
+            for Br in Br_list:
+                for Bc in Bc_list:
+                    configs.append(triton.Config({'Br': Br, 'Bc': Bc}, num_stages=num_stages, num_warps=num_warps))
     return configs
 @triton.autotune(
     configs=get_cuda_autotune_config(),

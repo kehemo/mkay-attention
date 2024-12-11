@@ -404,15 +404,15 @@ def flash2_bwd_dkdv(
 
         Sij = tl.dot(Qi, KjT) * softmax_scale
         Pij = tl.exp2(Sij / ln2 - Li[:, None])
-        Pij = Pij.to(tl.float16)
+        Pij = Pij.to(tl.bfloat16)
         dVj += tl.dot(Pij.T, dOi)
-        dVj = dVj.to(tl.float16)
+        dVj = dVj.to(tl.bfloat16)
 
         dPij = tl.dot(dOi, VjT)
         dSij = Pij * (dPij - Di[:, None])
-        dSij = dSij.to(tl.float16)
+        dSij = dSij.to(tl.bfloat16)
         dKj += (tl.dot(dSij.T, Qi) * softmax_scale)
-        dKj = dKj.to(tl.float16)
+        dKj = dKj.to(tl.bfloat16)
 
         Q_block_ptr = tl.advance(Q_block_ptr, (Br, 0))
         dO_block_ptr = tl.advance(dO_block_ptr, (Br, 0))

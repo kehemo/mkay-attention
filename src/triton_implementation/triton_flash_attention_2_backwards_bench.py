@@ -22,7 +22,7 @@ from triton_flash_attention_2_backwards import flash2_bwd_wrapper, naive_forward
     )
 )
 def benchmark_flash_attention_backward(BATCH, N_HEADS, N_CTX, HEAD_DIM, provider, device='cuda'):
-    dtype = torch.float16
+    dtype = torch.bfloat16
     qkv = torch.randn((BATCH, N_CTX, 3, N_HEADS, HEAD_DIM), device=device, dtype=dtype)
     q, k, v = qkv.unbind(dim=2)
     sm_scale = 1 / math.sqrt(HEAD_DIM)
