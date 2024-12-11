@@ -1,7 +1,9 @@
 #include <vector>
 #include <fstream>
 #include <string>
+#include <sstream>
 #include <iostream>
+#include <iomanip>
 #include <cuda_bf16.h>
 #include "kernel.hu"
 
@@ -22,7 +24,7 @@ launch_raw_result launch_attention_raw(num *q, num *k, num *v,
 
     // malloc output tensors
     num *O;
-    size_t output_size = sizeof(num) * batch_size * nheads * seqlen * seqlen;
+    size_t output_size = sizeof(num) * batch_size * nheads * seqlen * head_dim;
     CUDA_CHECK(cudaMalloc(&O, output_size));
 
     num *S;
@@ -78,6 +80,51 @@ launch_raw_result launch_attention_raw(num *q, num *k, num *v,
 
     return {O, output_size};
 }
+
+launch_raw_result bench_flash_attention_raw(num *q, num *k, num *v,
+                                            int batch_size, int seqlen, int nheads, int head_dim, int target_time_ms)
+{
+    attention_params params = {0};
+    params.batch_stride = seqlen * nheads * head_dim;
+    params.token_stride = nheads * head_dim;
+    params.head_stride = head_dim;
+    params.dim_stride = 1;
+    params.batch_size = batch_size;
+    params.seqlen = seqlen;
+    params.nheads = nheads;
+    params.head_dim = head_dim;
+    params.softmax_scale = rsqrtf(head_dim) * log2(exp(1));
+
+    // malloc output tensors
+    num *L;
+    size_t L_size = sizeof(num) * params.batch_size * params.nheads * params.seqlen;
+    CUDA_CHECK(cudaMalloc(&L, L_size));
+
+    num *o;
+    size_t output_size = sizeof(num) * batch_size * nheads * seqlen * head_dim;
+    CUDA_CHECK(cudaMalloc(&o, output_size));
+
+    double ops = 4.0 * batch_size * seqlen * seqlen * nheads * head_dim;
+    double best_time_ms = std::numeric_limits<double>::infinity();
+    double elapsed_ms = 0.0;
+    while (elapsed_ms < target_time_ms)
+    {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        auto start = std::chrono::high_resolution_clock::now();
+        launch_flash_attention(q, k, v, o, L, params);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        auto end = std::chrono::high_resolution_clock::now();
+        double this_ms = std::chrono::duration<double, std::milli>(end - start).count();
+        elapsed_ms += this_ms;
+        best_time_ms = std::min(best_time_ms, this_ms);
+    }
+    std::cout << "Time: " << best_time_ms << " ms" << std::endl;
+    std::cout << "Throughput: " << (ops / best_time_ms / 1e9) << " TFLOP/s" << std::endl;
+
+    CUDA_CHECK(cudaFree(L));
+    return {o, output_size};
+}
+
 /// <--- /your code here --->
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -90,7 +137,6 @@ num *read_input(std::string name)
     std::streamsize size = file.tellg();
     file.seekg(0, std::ios::beg);
 
-    std::cout << name << " " << size << std::endl;
     std::vector<char> buffer(size);
     if (file.read(buffer.data(), size))
     {
@@ -116,17 +162,24 @@ struct test_config
 
 int main(void)
 {
-    std::vector<test_config> configs = {{2, 32, 64, 32}};
-    for (auto config : configs)
+    std::ifstream test_sizes("test_sizes.csv");
+    std::string config_string;
+    while (getline(test_sizes, config_string))
     {
+        std::istringstream ss(config_string);
+        std::vector<int> params;
+        std::string param;
+        while (getline(ss, param, ','))
+        {
+            params.push_back(std::stoi(param));
+        }
+        test_config config = {params[0], params[1], params[2], params[3]};
         std::string test_pref = "test_" + std::to_string(config.batch_size) + "x" + std::to_string(config.seqlen) + "x" + std::to_string(config.nheads) + "x" + std::to_string(config.headdim);
         auto q = read_input(test_pref + "_q.bin");
         auto k = read_input(test_pref + "_k.bin");
         auto v = read_input(test_pref + "_v.bin");
-        auto result = launch_attention_raw(q, k, v, config.batch_size, config.seqlen, config.nheads, config.headdim);
-        std::cout << result.len << std::endl;
+        auto result = bench_flash_attention_raw(q, k, v, config.batch_size, config.seqlen, config.nheads, config.headdim, 1000);
         std::vector<char> out_buffer(result.len);
-        std::cout << result.data << std::endl;
         CUDA_CHECK(cudaMemcpy(out_buffer.data(), result.data, result.len, cudaMemcpyDeviceToHost));
         std::ofstream out_file("out/" + test_pref + "_o.bin");
         out_file.write(out_buffer.data(), out_buffer.size());

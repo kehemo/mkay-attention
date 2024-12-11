@@ -4,6 +4,7 @@ import math
 from einops import rearrange
 from ctypes import *
 import sys
+import numpy as np
 
 
 def attention_torch_checkpoint(qkv):
@@ -90,10 +91,16 @@ def check(batch_size, seqlen, nheads, headdim, run_id):
     torch_output = attention_torch_checkpoint(qkv)
     cuda_output = from_file(o_fname, dims=(batch_size, seqlen, nheads, headdim))
     get_tensor_difference(torch_output, cuda_output)
+    print(cuda_output / torch_output)
 
     rel_rmse = compute_relative_rmse(torch_output, cuda_output)
     print(f"\n\n>>> Relative RMSE: {rel_rmse}")
 
 
 run_id = sys.argv[1]
-check(2, 32, 64, 32, run_id)
+
+sizes = np.genfromtxt(
+    os.path.join(script_dir, "test_sizes.csv"), delimiter=",", ndmin=2, dtype=np.int32
+)
+for row_index in range(sizes.shape[0]):
+    check(*sizes[row_index].tolist(), run_id)
